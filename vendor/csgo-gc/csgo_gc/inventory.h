@@ -1,0 +1,361 @@
+#pragma once
+
+#include "gc_const_csgo.h"
+#include "item_schema.h"
+#include "owned_inventory.h"
+#include "random.h"
+
+class KeyValue;
+
+using ItemMap = std::unordered_map<uint64_t, CSOEconItem>;
+
+class Inventory
+{
+public:
+    Inventory(uint64_t steamId);
+    ~Inventory();
+
+    struct ParameterizedItemOptions
+    {
+        struct TournamentOptions
+        {
+            std::optional<uint32_t> eventId;
+            std::optional<uint32_t> stageId;
+            std::optional<uint32_t> team0Id;
+            std::optional<uint32_t> team1Id;
+            std::optional<uint32_t> mvpAccountId;
+        };
+
+        std::optional<uint32_t> level;
+        std::optional<uint32_t> quality;
+        std::optional<uint32_t> rarity;
+        std::optional<std::string> customName;
+
+        std::optional<uint32_t> paint;
+        std::optional<uint32_t> seed;
+        std::optional<float> wear;
+        std::optional<uint32_t> statTrak;
+        std::optional<uint32_t> music;
+        std::optional<uint32_t> sprayColor;
+        std::optional<uint32_t> sprayRemaining;
+        TournamentOptions tournament;
+
+        std::array<std::optional<uint32_t>, 6> sticker;
+        std::array<std::optional<float>, 6> stickerWear;
+        std::array<std::optional<float>, 6> stickerScale;
+        std::array<std::optional<float>, 6> stickerRotation;
+    };
+
+    void BuildCacheSubscription(CMsgSOCacheSubscribed &message, bool server);
+    struct OwnedManifestDelta
+    {
+        std::vector<CMsgSOSingleObject> removed, added;
+        CMsgSOMultipleObjects changed;
+    };
+    bool ReloadOwnedManifest(std::string &error, OwnedManifestDelta *delta = nullptr);
+    uint64_t Version() const { return m_version; }
+    int PlayerLevel() const { return m_playerLevel; }
+    int PlayerXp() const { return m_playerXp; }
+    bool HasAuthoritativePlayerProgress() const { return m_hasAuthoritativePlayerProgress; }
+    bool SetAuthoritativePlayerProgress(uint32_t playerLevel, uint32_t playerXp);
+    void BuildAuthoritativePlayerProgressUpdates(CMsgSOSingleObject &personaUpdate,
+        CMsgSOSingleObject &accountUpdate);
+
+    struct PrestigeMedalPlan
+    {
+        uint32_t defIndex{};
+        uint64_t upgradeId{};
+    };
+
+    struct PrestigeMedalClaim
+    {
+        CMsgSOSingleObject itemData;
+        CMsgSOSingleObject personaData;
+        uint64_t itemId{};
+        bool created{};
+    };
+
+    std::optional<PrestigeMedalPlan> GetPrestigeMedalPlan(uint32_t year) const;
+    bool ClaimPrestigeMedal(uint32_t year, uint32_t expectedDefIndex,
+        PrestigeMedalClaim &claim);
+
+    bool EquipItem(uint64_t itemId, uint32_t classId, uint32_t slotId, bool swap,
+        CMsgSOMultipleObjects &update);
+
+    bool RemoveItem(uint64_t itemId, CMsgSOSingleObject &destroy);
+
+    enum class UseItemChange
+    {
+        None,
+        Create,
+        Update
+    };
+
+    struct UseItemResult
+    {
+        CMsgSOSingleObject destroy;
+        CMsgSOSingleObject itemData;
+        CMsgSOMultipleObjects updateMultiple;
+        CMsgGCItemCustomizationNotification notification;
+        UseItemChange itemChange{ UseItemChange::None };
+    };
+
+    bool UseItem(uint64_t itemId, UseItemResult &result);
+
+    bool UnlockCrate(uint64_t crateId,
+        uint64_t keyId,
+        CMsgSOSingleObject &destroyCrate,
+        CMsgSOSingleObject &destroyKey,
+        CMsgSOSingleObject &newItem,
+        CMsgGCItemCustomizationNotification &notification);
+
+    bool CompleteAuthoritativeCrateOpen(uint64_t crateId,
+        uint64_t keyId,
+        const B2GOwnedItem &reward,
+        CMsgSOSingleObject &destroyCrate,
+        CMsgSOSingleObject &destroyKey,
+        CMsgSOSingleObject &newItem,
+        CMsgGCItemCustomizationNotification &notification);
+
+    bool CompleteAuthoritativeTradeUp(const std::array<uint64_t, 10> &inputItemIds,
+        const B2GOwnedItem &reward,
+        std::vector<CMsgSOSingleObject> &destroyItems,
+        CMsgSOSingleObject &newItem);
+
+    bool CompleteAuthoritativeSprayUnseal(uint64_t sealedAssetId,
+        const B2GOwnedItem &reward,
+        CMsgSOSingleObject &destroySealed,
+        CMsgSOSingleObject &newItem,
+        CMsgSOMultipleObjects &updateMultiple,
+        CMsgGCItemCustomizationNotification &notification);
+
+    bool ConsumeGraffiti(uint64_t itemId,
+        CMsgSOSingleObject &update,
+        CMsgSOSingleObject &destroy,
+        bool &consumed);
+
+    bool OpenStatTrakSwapToolBundle(uint64_t bundleId,
+        CMsgSOSingleObject &destroyBundle,
+        std::array<CMsgSOSingleObject, 2> &newTools,
+        CMsgGCItemCustomizationNotification &notification);
+
+    bool OpenSouvenirPackage(uint64_t packageId,
+        CMsgSOSingleObject &destroyPackage,
+        CMsgSOSingleObject &newItem,
+        CMsgGCItemCustomizationNotification &notification);
+
+    bool SetItemPositions(
+        const CMsgSetItemPositions &message,
+        std::vector<CMsgItemAcknowledged> &acknowledgements,
+        CMsgSOMultipleObjects &update);
+
+    bool ApplySticker(const CMsgApplySticker &message,
+        CMsgSOSingleObject &update,
+        CMsgSOSingleObject &destroy,
+        CMsgGCItemCustomizationNotification &notification);
+
+    bool ScrapeSticker(const CMsgApplySticker &message,
+        CMsgSOSingleObject &update,
+        CMsgSOSingleObject &destroy,
+        CMsgGCItemCustomizationNotification &notification);
+
+    uint64_t EquippedMusicKitItemId(bool statTrakOnly) const;
+    uint32_t EquippedMusicKitMVPCount(bool incrementForLocalMVP) const;
+    bool IncrementKillCountAttribute(uint64_t itemId, uint32_t amount, CMsgSOSingleObject &update);
+    // Validated game-server absolute count; changes only attr 80, never ownership,
+    // loadout, acquisition/New state, or the Steam inventory mirror.
+    bool ApplyAuthoritativeStatTrakCount(uint64_t itemId, uint32_t count, CMsgSOSingleObject &update, uint64_t ownershipGeneration = 0);
+
+    bool NameItem(uint64_t nameTagId,
+        uint64_t itemId,
+        std::string_view name,
+        CMsgSOSingleObject &update,
+        CMsgSOSingleObject &destroy,
+        CMsgGCItemCustomizationNotification &notification);
+
+    bool NameOwnedItemFree(uint64_t itemId,
+        std::string_view name,
+        CMsgSOSingleObject &update,
+        CMsgGCItemCustomizationNotification &notification);
+
+    bool NameBaseItem(uint64_t nameTagId,
+        uint32_t defIndex,
+        std::string_view name,
+        CMsgSOSingleObject &create,
+        CMsgSOSingleObject &destroy,
+        CMsgGCItemCustomizationNotification &notification);
+
+    bool RemoveItemName(uint64_t itemId,
+        CMsgSOSingleObject &update,
+        CMsgSOSingleObject &destroy,
+        CMsgGCItemCustomizationNotification &notification);
+
+    enum class StorageResult
+    {
+        Success,
+        CapacityExceeded,
+        ItemNotFound,
+        ContainerNotFound,
+        InvalidContainerType,
+        InternalError
+    };
+
+    struct StorageTransaction
+    {
+        CMsgSOSingleObject itemData;
+        CMsgSOSingleObject containerData;
+        EGCItemCustomizationNotification notificationType;
+        uint64_t affectedContainerId;
+        StorageResult outcome;
+        
+        bool Succeeded() const { return outcome == StorageResult::Success; }
+        bool ReachedCapacity() const { return outcome == StorageResult::CapacityExceeded; }
+    };
+
+    StorageTransaction DepositItemToStorage(uint64_t storageId, uint64_t itemId);
+    StorageTransaction WithdrawItemFromStorage(uint64_t storageId, uint64_t itemId);
+
+    enum class CounterSwapStatus
+    {
+        Completed,
+        ToolMissing,
+        InvalidTool,
+        WeaponMissing,
+        CounterAttributeAbsent,
+        InvalidWeaponState
+    };
+
+    struct CounterSwapResult
+    {
+        CounterSwapStatus status;
+        CMsgSOSingleObject toolRemoval;
+        CMsgSOSingleObject weaponAUpdate;
+        CMsgSOSingleObject weaponBUpdate;
+        uint64_t weaponAId;
+        uint64_t weaponBId;
+        
+        bool IsValid() const { return status == CounterSwapStatus::Completed; }
+    };
+
+    CounterSwapResult PerformCounterSwap(uint64_t toolId, uint64_t weaponAId, uint64_t weaponBId);
+
+    const CSOEconItem *GetItem(uint64_t itemId) const;
+    const ItemSchema &GetItemSchema() const { return m_itemSchema; }
+
+    // Trade-up contract: craft 10 items of same rarity into 1 item of next rarity
+    // Returns true on success, false on validation failure
+    bool TradeUp(const std::vector<uint64_t> &inputItemIds,
+        std::vector<CMsgSOSingleObject> &destroyItems,
+        CMsgSOSingleObject &newItem,
+        int16_t &responseRecipeIndex,
+        CSOEconItem **outCraftedItem = nullptr);
+
+    // returns the item id and adds the item to the provided CMsgSOMultipleObjects
+    // on failure returns 0 and does nothing
+    uint64_t PurchaseItem(uint32_t defIndex, std::vector<CMsgSOSingleObject> &update);
+
+    // Creates an item granted through RCON with the traded acquisition reason.
+    // Returns the item id on success, or 0 and an error string on failure.
+    uint64_t CreateRconItem(uint32_t defIndex,
+        const ParameterizedItemOptions &options,
+        CMsgSOSingleObject &update,
+        std::string &error);
+    size_t ItemCount() const { return m_items.size(); }
+    const ItemMap &Items() const { return m_items; }
+    std::vector<uint64_t> EquippedItemIds() const;
+    uint64_t OwnedGeneration(uint64_t assetId) const {
+        const auto found = m_ownedGenerations.find(assetId);
+        return found == m_ownedGenerations.end() ? 0 : found->second;
+    }
+    bool HasItemDefinition(uint32_t defIndex) const;
+    const std::set<uint64_t> &EventFavorites() const { return m_eventFavorites; }
+    bool SetEventFavorite(uint64_t eventId, bool favorite);
+    bool Save() const { return WriteToFile(); }
+
+private:
+    uint32_t AccountId() const;
+
+    // allocates an empty item, sets id and account_id fields
+    // pass zero as highItemId to generate a new one
+    CSOEconItem &AllocateItem(uint32_t highItemId);
+
+    // create a new item of a specific type
+    CSOEconItem &CreateItem(const CSOEconItem &copyFrom);
+    CSOEconItem &CreateItem(uint32_t defIndex, ItemOrigin origin, UnacknowledgedType unacknowledgedType);
+
+    void ReadFromFile();
+    void ReadFromOwnedManifest();
+    void ReadOwnedLoadout();
+    void NormalizeOwnedLoadout();
+    void ReadItem(const KeyValue &itemKey, CSOEconItem &item) const;
+    void DeduplicateStatsSubscriptions();
+    void LogInventoryConsistency() const;
+
+    bool WriteToFile() const;
+    bool WriteOwnedLoadout() const;
+    void WriteItem(KeyValue &itemKey, const CSOEconItem &item) const;
+
+    // helper, only called via EquipItem
+    bool UnequipItemForClass(uint64_t itemId, uint32_t classId, CMsgSOMultipleObjects &update);
+    void UnequipSlotForClass(uint32_t classId, uint32_t slotId, CMsgSOMultipleObjects &update);
+
+    void DestroyItem(ItemMap::iterator iterator, CMsgSOSingleObject &message);
+    bool ActivateTournamentAccessItem(ItemMap::iterator accessItem,
+        const TournamentAccessInfo &access, UseItemResult &result);
+
+    // move this to the item schema maybe?
+    void ItemToPreviewDataBlock(const CSOEconItem &item, CEconItemPreviewDataBlock &block);
+
+    // helpers for serializing items to CMsgSOMultipleObjects and CMsgSOSingleObject
+    void AddToMultipleObjects(CMsgSOMultipleObjects &message, SOTypeId type, const google::protobuf::MessageLite &object);
+    void ToSingleObject(CMsgSOSingleObject &message, SOTypeId type, const google::protobuf::MessageLite &object);
+    uint64_t AdvanceVersion();
+
+    // helpers for above..
+    void AddToMultipleObjects(CMsgSOMultipleObjects &message, const CSOEconItem &object)
+    {
+        AddToMultipleObjects(message, SOTypeItem, object);
+    }
+
+    void ToSingleObject(CMsgSOSingleObject &message, const CSOEconItem &object)
+    {
+        ToSingleObject(message, SOTypeItem, object);
+    }
+
+    void AddToMultipleObjects(CMsgSOMultipleObjects &message, const CSOEconDefaultEquippedDefinitionInstanceClient &object)
+    {
+        AddToMultipleObjects(message, SOTypeDefaultEquippedDefinitionInstanceClient, object);
+    }
+
+    void ToSingleObject(CMsgSOSingleObject &message, const CSOEconDefaultEquippedDefinitionInstanceClient &object)
+    {
+        ToSingleObject(message, SOTypeDefaultEquippedDefinitionInstanceClient, object);
+    }
+
+    struct StorageItemPair { CSOEconItem* storage; CSOEconItem* target; };
+    StorageItemPair ResolveStorageItems(uint64_t storageId, uint64_t targetId);
+    void EmbedStorageReference(CSOEconItem &item, uint64_t storageId);
+    void StripStorageReference(CSOEconItem &item);
+    bool ModifyStorageCounter(CSOEconItem &storage, int delta);
+
+    void ConsumeToolItem(uint64_t toolId, CMsgSOSingleObject &removalMsg);
+
+    const uint64_t m_steamId;
+    const int m_configuredPlayerLevel;
+    const int m_configuredPlayerXp;
+    int m_playerLevel;
+    int m_playerXp;
+    bool m_hasAuthoritativePlayerProgress{};
+    uint64_t m_version;
+    ItemSchema m_itemSchema;
+    Random m_random;
+    uint32_t m_lastHighItemId{};
+    ItemMap m_items;
+    std::unordered_map<uint64_t, uint32_t> m_ownedLoadoutSlots;
+    struct LiveStatTrakCount { uint64_t ownershipGeneration{}; uint32_t count{}; };
+    std::unordered_map<uint64_t, LiveStatTrakCount> m_liveStatTrakCounts;
+    std::unordered_map<uint64_t, uint64_t> m_ownedGenerations;
+    std::vector<CSOEconDefaultEquippedDefinitionInstanceClient> m_defaultEquips;
+    std::set<uint64_t> m_eventFavorites;
+    bool m_saveEnabled{ true };
+};

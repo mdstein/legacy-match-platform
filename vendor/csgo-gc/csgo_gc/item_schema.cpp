@@ -1,0 +1,1887 @@
+#include "stdafx.h"
+#include "item_schema.h"
+#include "config.h"
+#include "keyvalue.h"
+#include "random.h"
+
+// ideally this would get parsed from the item schema...
+static uint32_t ItemRarityFromString(std::string_view name)
+{
+    const std::pair<std::string_view, uint32_t> rarityNames[] = {
+        { "default", ItemSchema::RarityDefault },
+        { "common", ItemSchema::RarityCommon },
+        { "uncommon", ItemSchema::RarityUncommon },
+        { "rare", ItemSchema::RarityRare },
+        { "mythical", ItemSchema::RarityMythical },
+        { "legendary", ItemSchema::RarityLegendary },
+        { "ancient", ItemSchema::RarityAncient },
+        { "immortal", ItemSchema::RarityImmortal },
+        { "unusual", ItemSchema::RarityUnusual },
+    };
+
+    for (const auto &pair : rarityNames)
+    {
+        if (pair.first == name)
+        {
+            return pair.second;
+        }
+    }
+
+    assert(false);
+    return ItemSchema::RarityCommon;
+}
+
+AttributeInfo::AttributeInfo(const KeyValue &key)
+{
+    std::string_view type = key.GetString("attribute_type");
+    if (type.size())
+    {
+        if (type == "float")
+        {
+            m_type = AttributeType::Float;
+        }
+        else if (type == "uint32")
+        {
+            m_type = AttributeType::Uint32;
+        }
+        else if (type == "string")
+        {
+            m_type = AttributeType::String;
+        }
+        else
+        {
+            // not supported, fall back to float
+            Platform::Print("Unsupported attribute type %s\n", std::string{ type }.c_str());
+            m_type = AttributeType::Float;
+        }
+    }
+    else
+    {
+        bool integer = key.GetNumber<int>("stored_as_integer");
+        m_type = integer ? AttributeType::Uint32 : AttributeType::Float;
+    }
+}
+
+ItemInfo::ItemInfo(uint32_t defIndex)
+    : m_defIndex{ defIndex }
+    , m_rarity{ ItemSchema::RarityCommon }
+    , m_quality{ ItemSchema::QualityNormal }
+    , m_level{ 1 }
+    , m_supplyCrateSeries{ 0 }
+    , m_stickerSlotCount{ 0 }
+    , m_prestigeYear{ 0 }
+    , m_canSticker{ false }
+    , m_canPatch{ false }
+    , m_nameable{ false }
+    , m_canStatTrakSwap{ false }
+    , m_isCoupon{ false }
+    , m_willProduceStatTrak{ false }
+{
+    // RecursiveParseItem parses the rest
+}
+
+PaintKitInfo::PaintKitInfo(const KeyValue &key, float defaultMinFloat, float defaultMaxFloat)
+    : m_defIndex{ FromString<uint32_t>(key.Name()) }
+    , m_rarity{ ItemSchema::RarityCommon } // rarity is not set here, done in ParsePaintKitRarities
+{
+    m_minFloat = key.GetNumber<float>("wear_remap_min", defaultMinFloat);
+    m_maxFloat = key.GetNumber<float>("wear_remap_max", defaultMaxFloat);
+}
+
+StickerKitInfo::StickerKitInfo(const KeyValue &key)
+    : m_defIndex{ FromString<uint32_t>(key.Name()) }
+    , m_name{ key.GetString("name") }
+    , m_rarity{ ItemSchema::RarityDefault }
+    , m_tournamentEventId{ 0 }
+    , m_tournamentTeamId{ 0 }
+    , m_tournamentPlayerId{ 0 }
+{
+    std::string_view rarity = key.GetString("item_rarity");
+    if (rarity.size())
+    {
+        m_rarity = ItemRarityFromString(rarity);
+    }
+
+    m_tournamentEventId = key.GetNumber<uint32_t>("tournament_event_id", 0);
+    m_tournamentTeamId = key.GetNumber<uint32_t>("tournament_team_id", 0);
+    m_tournamentPlayerId = key.GetNumber<uint32_t>("tournament_player_id", 0);
+}
+
+MusicDefinitionInfo::MusicDefinitionInfo(const KeyValue &key)
+    : m_defIndex{ FromString<uint32_t>(key.Name()) }
+{
+    assert(m_defIndex);
+}
+
+uint32_t LootListItem::CaseRarity() const
+{
+    if (quality == ItemSchema::QualityUnusual)
+    {
+        return ItemSchema::RarityUnusual;
+    }
+
+    return rarity;
+}
+
+ItemSchema::ItemSchema()
+    : ItemSchema{ true }
+{
+}
+
+ItemSchema::ItemSchema(bool loadFiles)
+{
+    if (!loadFiles)
+    {
+        return;
+    }
+
+    KeyValue itemSchema{ "root" };
+    if (!itemSchema.ParseFromFile("csgo/scripts/items/items_game.txt"))
+    {
+        assert(false);
+        return;
+    }
+
+    const KeyValue *itemsGame = itemSchema.GetSubkey("items_game");
+    if (!itemsGame)
+    {
+        assert(false);
+        return;
+    }
+
+    const KeyValue *attributesKey = itemsGame->GetSubkey("attributes");
+    if (attributesKey)
+    {
+        ParseAttributes(attributesKey);
+    }
+
+    const KeyValue *itemsKey = itemsGame->GetSubkey("items");
+    if (itemsKey)
+    {
+        ParseItems(itemsKey, itemsGame->GetSubkey("prefabs"));
+    }
+
+    const KeyValue *stickerKitsKey = itemsGame->GetSubkey("sticker_kits");
+    if (stickerKitsKey)
+    {
+        ParseStickerKits(stickerKitsKey);
+    }
+
+    const KeyValue *paintKitsKey = itemsGame->GetSubkey("paint_kits");
+    if (paintKitsKey)
+    {
+        ParsePaintKits(paintKitsKey);
+    }
+
+    const KeyValue *paintKitsRarityKey = itemsGame->GetSubkey("paint_kits_rarity");
+    if (paintKitsRarityKey)
+    {
+        ParsePaintKitRarities(paintKitsRarityKey);
+    }
+
+    const KeyValue *itemSetsKey = itemsGame->GetSubkey("item_sets");
+    if (itemSetsKey)
+    {
+        ParseItemSets(itemSetsKey);
+    }
+
+    const KeyValue *musicDefinitionsKey = itemsGame->GetSubkey("music_definitions");
+    if (musicDefinitionsKey)
+    {
+        ParseMusicDefinitions(musicDefinitionsKey);
+    }
+
+    // unusual loot lists are not included in client_loot_lists
+    // we need to parse these after items and paint kits but before client_loot_lists
+    {
+        KeyValue unusualLootLists{ "unusual_loot_lists" };
+
+        if (unusualLootLists.ParseFromFile("csgo_gc/unusual_loot_lists.txt"))
+        {
+            ParseLootLists(&unusualLootLists, true);
+        }
+        else
+        {
+            // no knives sorry
+            assert(false);
+        }
+    }
+
+    const KeyValue *lootListsKey = itemsGame->GetSubkey("client_loot_lists");
+    if (lootListsKey)
+    {
+        ParseLootLists(lootListsKey, false);
+    }
+
+    // Some loot lists are only present in Valve's GC schema and are not
+    // included in the client items_game.txt. Load supplemental definitions
+    // from a data file so they can be updated without rebuilding the library.
+    {
+        KeyValue gcLootLists{ "gc_loot_lists" };
+
+        if (gcLootLists.ParseFromFile("csgo_gc/gc_loot_lists.txt"))
+        {
+            ParseLootLists(&gcLootLists, false);
+        }
+        else
+        {
+            Platform::Print("csgo_gc/gc_loot_lists.txt not found, server-only loot lists will be unavailable\n");
+        }
+    }
+
+    const KeyValue *revolvingLootListsKey = itemsGame->GetSubkey("revolving_loot_lists");
+    if (revolvingLootListsKey)
+    {
+        ParseRevolvingLootLists(revolvingLootListsKey);
+    }
+}
+
+float ItemSchema::AttributeFloat(const CSOEconItemAttribute *attribute) const
+{
+    auto it = m_attributeInfo.find(attribute->def_index());
+    if (it == m_attributeInfo.end())
+    {
+        assert(false);
+        return 0;
+    }
+
+    switch (it->second.m_type)
+    {
+    case AttributeType::Float:
+        return *reinterpret_cast<const float *>(attribute->value_bytes().data());
+
+    case AttributeType::Uint32:
+        return *reinterpret_cast<const uint32_t *>(attribute->value_bytes().data());
+
+    case AttributeType::String:
+        return FromString<float>(attribute->value_bytes());
+
+    default:
+        assert(false);
+        return 0;
+    }
+}
+
+uint32_t ItemSchema::AttributeUint32(const CSOEconItemAttribute *attribute) const
+{
+    auto it = m_attributeInfo.find(attribute->def_index());
+    if (it == m_attributeInfo.end())
+    {
+        assert(false);
+        return 0;
+    }
+
+    switch (it->second.m_type)
+    {
+    case AttributeType::Float:
+        return *reinterpret_cast<const float *>(attribute->value_bytes().data());
+
+    case AttributeType::Uint32:
+        return *reinterpret_cast<const uint32_t *>(attribute->value_bytes().data());
+
+    case AttributeType::String:
+        return FromString<uint32_t>(attribute->value_bytes());
+
+    default:
+        assert(false);
+        return 0;
+    }
+}
+
+std::string ItemSchema::AttributeString(const CSOEconItemAttribute *attribute) const
+{
+    auto it = m_attributeInfo.find(attribute->def_index());
+    if (it == m_attributeInfo.end())
+    {
+        assert(false);
+        return {};
+    }
+
+    switch (it->second.m_type)
+    {
+    case AttributeType::Float:
+        return std::to_string(*reinterpret_cast<const float *>(attribute->value_bytes().data()));
+
+    case AttributeType::Uint32:
+        return std::to_string(*reinterpret_cast<const uint32_t *>(attribute->value_bytes().data()));
+
+    case AttributeType::String:
+        return attribute->value_bytes();
+
+    default:
+        assert(false);
+        return {};
+    }
+}
+
+bool ItemSchema::SetAttributeFloat(CSOEconItemAttribute *attribute, float value) const
+{
+    auto it = m_attributeInfo.find(attribute->def_index());
+    if (it == m_attributeInfo.end())
+    {
+        assert(false);
+        return false;
+    }
+
+    switch (it->second.m_type)
+    {
+    case AttributeType::Float:
+    {
+        attribute->set_value_bytes(&value, sizeof(value));
+        break;
+    }
+
+    case AttributeType::Uint32:
+    {
+        uint32_t convert = static_cast<uint32_t>(value);
+        attribute->set_value_bytes(&convert, sizeof(convert));
+        break;
+    }
+
+    case AttributeType::String:
+    {
+        std::string convert = std::to_string(value);
+        attribute->set_value_bytes(std::move(convert));
+        break;
+    }
+
+    default:
+        assert(false);
+        return false;
+    }
+
+    return true;
+}
+
+bool ItemSchema::SetAttributeUint32(CSOEconItemAttribute *attribute, uint32_t value) const
+{
+    auto it = m_attributeInfo.find(attribute->def_index());
+    if (it == m_attributeInfo.end())
+    {
+        assert(false);
+        return false;
+    }
+
+    switch (it->second.m_type)
+    {
+    case AttributeType::Float:
+    {
+        float convert = static_cast<float>(value);
+        attribute->set_value_bytes(&convert, sizeof(convert));
+        break;
+    }
+
+    case AttributeType::Uint32:
+    {
+        attribute->set_value_bytes(&value, sizeof(value));
+        break;
+    }
+
+    case AttributeType::String:
+    {
+        std::string convert = std::to_string(value);
+        attribute->set_value_bytes(std::move(convert));
+        break;
+    }
+
+    default:
+        assert(false);
+        return false;
+    }
+
+    return true;
+}
+
+bool ItemSchema::SetAttributeString(CSOEconItemAttribute *attribute, std::string_view value) const
+{
+    auto it = m_attributeInfo.find(attribute->def_index());
+    if (it == m_attributeInfo.end())
+    {
+        assert(false);
+        return false;
+    }
+
+    switch (it->second.m_type)
+    {
+    case AttributeType::Float:
+    {
+        float convert = FromString<float>(value);
+        attribute->set_value_bytes(&convert, sizeof(convert));
+        break;
+    }
+
+    case AttributeType::Uint32:
+    {
+        uint32_t convert = FromString<uint32_t>(value);
+        attribute->set_value_bytes(&convert, sizeof(convert));
+        break;
+    }
+
+    case AttributeType::String:
+    {
+        attribute->set_value_bytes(value.data(), value.size());
+        break;
+    }
+
+    default:
+        assert(false);
+        return false;
+    }
+
+    return true;
+}
+
+const LootList *ItemSchema::GetCrateLootList(uint32_t crateDefIndex) const
+{
+    auto itemSearch = m_itemInfo.find(crateDefIndex);
+    if (itemSearch == m_itemInfo.end())
+    {
+        Platform::Print("GetCrateLootList: crate def_index %u not found\n", crateDefIndex);
+        return nullptr;
+    }
+
+    const ItemInfo &itemInfo = itemSearch->second;
+
+    if (itemInfo.m_supplyCrateSeries)
+    {
+        auto lootListSearch = m_revolvingLootLists.find(itemInfo.m_supplyCrateSeries);
+        if (lootListSearch != m_revolvingLootLists.end())
+        {
+            return &lootListSearch->second;
+        }
+    }
+
+    // Self-opening collection packages, agent containers and tournament
+    // capsules point directly at a loot list instead of a revolving series.
+    // Coupon definitions also use loot_list_name, but their list describes
+    // the purchased item rather than contents that can be opened.
+    if (!itemInfo.m_isCoupon && !itemInfo.m_lootListName.empty())
+    {
+        auto lootListSearch = m_lootLists.find(itemInfo.m_lootListName);
+        if (lootListSearch != m_lootLists.end())
+        {
+            return &lootListSearch->second;
+        }
+    }
+
+    return nullptr;
+}
+
+static bool LootListContainsItemType(const LootList &lootList, LootListItemType type)
+{
+    for (const LootListItem &item : lootList.items)
+    {
+        if (item.type == type)
+        {
+            return true;
+        }
+    }
+
+    for (const LootList *subList : lootList.subLists)
+    {
+        if (subList && LootListContainsItemType(*subList, type))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool ItemSchema::IsSouvenirPackage(const CSOEconItem &item) const
+{
+    const ItemInfo *itemInfo = ItemInfoByDefIndex(item.def_index());
+    if (!itemInfo)
+    {
+        return false;
+    }
+
+    const LootList *lootList = GetCrateLootList(item.def_index());
+    if (!lootList || !LootListContainsItemType(*lootList, LootListItemPaintable))
+    {
+        // Tournament sticker capsules can carry event metadata too, but their
+        // loot lists contain stickers rather than painted souvenir weapons.
+        return false;
+    }
+
+    // The common souvenir package prefabs identify both legacy and modern
+    // packages without relying on a broad def_index range.
+    for (const std::string &prefab : itemInfo->m_prefabs)
+    {
+        if (prefab.find("souvenir") != std::string::npos)
+        {
+            return true;
+        }
+    }
+
+    uint32_t tournamentEventId = itemInfo->m_tournament.eventId;
+    for (const CSOEconItemAttribute &attribute : item.attribute())
+    {
+        if (attribute.def_index() == AttributeTournamentEventId)
+        {
+            tournamentEventId = AttributeUint32(&attribute);
+            break;
+        }
+    }
+
+    return tournamentEventId != 0;
+}
+
+bool ItemSchema::CreateItemFromLootListItem(Random &random,
+    const LootListItem &lootListItem,
+    bool statTrak,
+    ItemOrigin origin,
+    UnacknowledgedType unacknowledgedType,
+    CSOEconItem &item) const
+{
+    if (!CreateItem(lootListItem.itemInfo->m_defIndex, origin, unacknowledgedType, item))
+    {
+        assert(false);
+        return false;
+    }
+
+    // Painted weapons are normal schema items, but their econ instances are unique
+    // unless StatTrak elevates them to strange. The client-side trade-up filters
+    // key off this quality before the GC ever sees a craft request.
+    if (statTrak && lootListItem.quality != ItemSchema::QualityUnusual)
+    {
+        item.set_quality(ItemSchema::QualityStrange);
+    }
+    else if (lootListItem.type == LootListItemPaintable && lootListItem.quality != ItemSchema::QualityUnusual)
+    {
+        item.set_quality(ItemSchema::QualityUnique);
+    }
+    else
+    {
+        item.set_quality(lootListItem.quality);
+    }
+
+    // rarity override
+    assert(lootListItem.rarity >= ItemSchema::RarityCommon && lootListItem.rarity <= ItemSchema::RarityImmortal);
+    item.set_rarity(lootListItem.rarity);
+
+    // setup type specficic attributes
+
+    if (lootListItem.type == LootListItemSticker)
+    {
+        CSOEconItemAttribute *attribute = item.add_attribute();
+        attribute->set_def_index(ItemSchema::AttributeStickerId0);
+        SetAttributeUint32(attribute, lootListItem.stickerKitInfo->m_defIndex);
+
+        // Tournament capsules produce normal sticker items that retain their
+        // event metadata. This is distinct from souvenir weapon generation.
+        if (lootListItem.stickerKitInfo->m_tournamentEventId)
+        {
+            attribute = item.add_attribute();
+            attribute->set_def_index(ItemSchema::AttributeTournamentEventId);
+            SetAttributeUint32(attribute, lootListItem.stickerKitInfo->m_tournamentEventId);
+        }
+    }
+    else if (lootListItem.type == LootListItemSpray)
+    {
+        CSOEconItemAttribute *attribute = item.add_attribute();
+        attribute->set_def_index(ItemSchema::AttributeStickerId0);
+        SetAttributeUint32(attribute, lootListItem.stickerKitInfo->m_defIndex);
+
+        // add AttributeSpraysRemaining when it's unsealed (mikkotodo how does the real gc do this)
+
+        attribute = item.add_attribute();
+        attribute->set_def_index(ItemSchema::AttributeSprayTintId);
+        SetAttributeUint32(attribute, random.Integer<uint32_t>(ItemSchema::GraffitiTintMin, ItemSchema::GraffitiTintMax));
+    }
+    else if (lootListItem.type == LootListItemPatch)
+    {
+        // mikkotodo anything else?
+        CSOEconItemAttribute *attribute = item.add_attribute();
+        attribute->set_def_index(ItemSchema::AttributeStickerId0);
+        SetAttributeUint32(attribute, lootListItem.stickerKitInfo->m_defIndex);
+    }
+    else if (lootListItem.type == LootListItemMusicKit)
+    {
+        CSOEconItemAttribute *attribute = item.add_attribute();
+        attribute->set_def_index(ItemSchema::AttributeMusicId);
+        SetAttributeUint32(attribute, lootListItem.musicDefinitionInfo->m_defIndex);
+    }
+    else if (lootListItem.type == LootListItemPaintable)
+    {
+        const PaintKitInfo *paintKitInfo = lootListItem.paintKitInfo;
+
+        CSOEconItemAttribute *attribute = item.add_attribute();
+        attribute->set_def_index(ItemSchema::AttributeTexturePrefab);
+        SetAttributeUint32(attribute, paintKitInfo->m_defIndex);
+
+        attribute = item.add_attribute();
+        attribute->set_def_index(ItemSchema::AttributeTextureSeed);
+        SetAttributeUint32(attribute, random.Integer<uint32_t>(0, 1000));
+
+        // mikkotodo how does the float distribution work?
+        attribute = item.add_attribute();
+        attribute->set_def_index(ItemSchema::AttributeTextureWear);
+        SetAttributeFloat(attribute, random.Float(paintKitInfo->m_minFloat, paintKitInfo->m_maxFloat));
+    }
+    else if (lootListItem.type == LootListItemNoAttribute)
+    {
+        // nothing
+    }
+    else
+    {
+        assert(false);
+    }
+
+    if (statTrak)
+    {
+        assert((lootListItem.type == LootListItemMusicKit) || (lootListItem.type == LootListItemPaintable));
+
+        CSOEconItemAttribute *attribute = item.add_attribute();
+        attribute->set_def_index(ItemSchema::AttributeKillEater);
+        SetAttributeUint32(attribute, 0);
+
+        // score type: 1 for music kits, 0 for weapons
+        int scoreType = (lootListItem.type == LootListItemMusicKit) ? 1 : 0;
+
+        attribute = item.add_attribute();
+        attribute->set_def_index(ItemSchema::AttributeKillEaterScoreType);
+        SetAttributeUint32(attribute, scoreType);
+    }
+
+    return true;
+}
+
+bool ItemSchema::CreateItem(uint32_t defIndex, ItemOrigin origin, UnacknowledgedType unacknowledgedType, CSOEconItem &econItem) const
+{
+    auto itemSearch = m_itemInfo.find(defIndex);
+    if (itemSearch == m_itemInfo.end())
+    {
+        assert(false);
+        return false;
+    }
+
+    const ItemInfo &itemInfo = itemSearch->second;
+
+    // urgh wtf is this crap
+    if (itemInfo.m_isCoupon)
+    {
+        assert(itemInfo.m_lootListName.size());
+        auto lootListSearch = m_lootLists.find(itemInfo.m_lootListName);
+        if (lootListSearch == m_lootLists.end())
+        {
+            assert(false);
+            return false;
+        }
+
+        const LootList &lootList = lootListSearch->second;
+        assert(lootList.subLists.size() == 0 && lootList.items.size() == 1);
+        assert(lootList.willProduceStatTrak == false && lootList.isUnusual == false);
+
+        Random random;
+
+        return CreateItemFromLootListItem(random,
+            lootList.items.front(),
+            itemInfo.m_willProduceStatTrak,
+            origin,
+            unacknowledgedType,
+            econItem);
+    }
+
+    econItem.set_inventory(InventoryUnacknowledged(unacknowledgedType));
+    econItem.set_def_index(defIndex);
+    econItem.set_quantity(1);
+    econItem.set_level(itemInfo.m_level);
+    econItem.set_quality(itemInfo.m_quality);
+    econItem.set_flags(0);
+    econItem.set_origin(origin);
+    econItem.set_in_use(false);
+    econItem.set_rarity(itemInfo.m_rarity);
+
+    return ApplyGeneratedAttributes(itemInfo, econItem);
+}
+
+bool ItemSchema::ApplyGeneratedAttributes(const ItemInfo &info, CSOEconItem &item) const
+{
+    for (const GeneratedItemAttribute &generated : info.m_generatedAttributes)
+    {
+        auto attributeInfo = m_attributeInfo.find(generated.defIndex);
+        if (attributeInfo == m_attributeInfo.end())
+        {
+            return false;
+        }
+
+        CSOEconItemAttribute *attribute = item.add_attribute();
+        attribute->set_def_index(generated.defIndex);
+
+        bool applied = false;
+        switch (attributeInfo->second.m_type)
+        {
+        case AttributeType::Float:
+            applied = SetAttributeFloat(attribute, FromString<float>(generated.value));
+            break;
+        case AttributeType::Uint32:
+            applied = SetAttributeUint32(attribute, FromString<uint32_t>(generated.value));
+            break;
+        case AttributeType::String:
+            applied = SetAttributeString(attribute, generated.value);
+            break;
+        }
+
+        if (!applied)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void ItemSchema::ParseItems(const KeyValue *itemsKey, const KeyValue *prefabsKey)
+{
+    m_itemInfo.reserve(itemsKey->SubkeyCount());
+
+    for (const KeyValue &itemKey : *itemsKey)
+    {
+        if (itemKey.Name() == "default")
+        {
+            // ignore this
+            continue;
+        }
+
+        uint32_t defIndex = FromString<uint32_t>(itemKey.Name());
+        auto emplace = m_itemInfo.try_emplace(defIndex, defIndex);
+
+        ParseItemRecursive(emplace.first->second, itemKey, prefabsKey);
+
+        if (!emplace.first->second.m_name.empty())
+        {
+            m_itemDefIndexByName[emplace.first->second.m_name] = defIndex;
+        }
+
+        // FIXME: remove, temp slop to make sure we parse correctly
+        auto &itemInfo = emplace.first->second;
+        if (itemInfo.m_isCoupon)
+        {
+            assert(itemInfo.m_lootListName.size());
+        }
+        else
+        {
+            assert(!itemInfo.m_willProduceStatTrak);
+        }
+    }
+}
+
+// ideally this would get parsed from the item schema...
+static uint32_t ItemQualityFromString(std::string_view name)
+{
+    const std::pair<std::string_view, uint32_t> qualityNames[] = {
+        { "normal", ItemSchema::QualityNormal },
+        { "genuine", ItemSchema::QualityGenuine },
+        { "vintage", ItemSchema::QualityVintage },
+        { "unusual", ItemSchema::QualityUnusual },
+        { "unique", ItemSchema::QualityUnique },
+        { "community", ItemSchema::QualityCommunity },
+        { "developer", ItemSchema::QualityDeveloper },
+        { "selfmade", ItemSchema::QualitySelfmade },
+        { "customized", ItemSchema::QualityCustomized },
+        { "strange", ItemSchema::QualityStrange },
+        { "completed", ItemSchema::QualityCompleted },
+        { "haunted", ItemSchema::QualityHaunted },
+        { "tournament", ItemSchema::QualityTournament },
+    };
+
+    for (const auto &pair : qualityNames)
+    {
+        if (pair.first == name)
+        {
+            return pair.second;
+        }
+    }
+
+    assert(false);
+    return ItemSchema::QualityUnique; // i guess???
+}
+
+// i hate my life
+static std::vector<std::string_view> SplitString(std::string_view input, char delimiter)
+{
+    size_t offset = 0;
+    std::vector<std::string_view> result;
+
+    while (true)
+    {
+        size_t i = input.find(delimiter, offset);
+        if (i == std::string_view::npos)
+        {
+            result.emplace_back(input.substr(offset));
+            break;
+        }
+
+        result.emplace_back(input.substr(offset, i - offset));
+        offset = i + 1;
+    }
+
+    return result;
+}
+
+void ItemSchema::ParseItemRecursive(ItemInfo &info, const KeyValue &itemKey, const KeyValue *prefabsKey)
+{
+    std::string_view prefabString = itemKey.GetString("prefab");
+    if (prefabString.size() && prefabsKey)
+    {
+        // might have multiple specifications in a single statement
+        std::vector<std::string_view> prefabNames = SplitString(prefabString, ' ');
+        for (std::string_view prefabName : prefabNames)
+        {
+            info.m_prefabs.emplace_back(prefabName);
+
+            const KeyValue *prefabKey = prefabsKey->GetSubkey(prefabName);
+            if (prefabKey)
+            {
+                ParseItemRecursive(info, *prefabKey, prefabsKey);
+            }
+            else
+            {
+                // not available to us mortals...
+                Platform::Print("No such prefab '%s'\n", std::string{ prefabName }.c_str());
+            }
+        }
+    }
+
+    std::string_view name = itemKey.GetString("name");
+    if (name.size())
+    {
+        info.m_name = name;
+    }
+
+    if (const KeyValue *classes = itemKey.GetSubkey("used_by_classes"))
+    {
+        info.m_usedByClasses = 0;
+        if (classes->GetNumber<int>("noteam")) info.m_usedByClasses |= 1u;
+        if (classes->GetNumber<int>("terrorists")) info.m_usedByClasses |= 1u << 2;
+        if (classes->GetNumber<int>("counter-terrorists")) info.m_usedByClasses |= 1u << 3;
+    }
+
+    std::string_view quality = itemKey.GetString("item_quality");
+    if (quality.size())
+    {
+        info.m_quality = ItemQualityFromString(quality);
+    }
+
+    std::string_view rarity = itemKey.GetString("item_rarity");
+    if (rarity.size())
+    {
+        info.m_rarity = ItemRarityFromString(rarity);
+    }
+
+    uint32_t minLevel = itemKey.GetNumber<uint32_t>("min_ilevel", 0);
+    uint32_t maxLevel = itemKey.GetNumber<uint32_t>("max_ilevel", 0);
+    if (minLevel && maxLevel)
+    {
+        assert(minLevel == maxLevel);
+        info.m_level = minLevel;
+    }
+
+    std::string_view itemType = itemKey.GetString("item_type");
+    if (itemType.size())
+    {
+        info.m_itemType = itemType;
+        info.m_isCoupon = (itemType == "coupon");
+    }
+
+    std::string_view lootListName = itemKey.GetString("loot_list_name");
+    if (lootListName.size())
+    {
+        info.m_lootListName = lootListName;
+    }
+
+    const KeyValue *stickers = itemKey.GetSubkey("stickers");
+    if (stickers)
+    {
+        for (const KeyValue &sticker : *stickers)
+        {
+            uint32_t slot = FromString<uint32_t>(sticker.Name());
+            if (slot >= static_cast<uint32_t>(MaxStickers))
+            {
+                Platform::Print("Item %u has unsupported sticker slot %u\n", info.m_defIndex, slot);
+                continue;
+            }
+
+            info.m_stickerSlotCount = std::max(info.m_stickerSlotCount, slot + 1);
+        }
+    }
+
+    info.m_willProduceStatTrak = itemKey.GetNumber("will_produce_stattrak", false);
+
+    const KeyValue *capabilities = itemKey.GetSubkey("capabilities");
+    if (capabilities)
+    {
+        const KeyValue *canSticker = capabilities->GetSubkey("can_sticker");
+        if (canSticker)
+        {
+            info.m_canSticker = FromString<int>(canSticker->String()) != 0;
+        }
+
+        const KeyValue *canPatch = capabilities->GetSubkey("can_patch");
+        if (canPatch)
+        {
+            info.m_canPatch = FromString<int>(canPatch->String()) != 0;
+        }
+
+        const KeyValue *nameable = capabilities->GetSubkey("nameable");
+        if (nameable)
+        {
+            info.m_nameable = FromString<int>(nameable->String()) != 0;
+        }
+
+        const KeyValue *canStatTrakSwap = capabilities->GetSubkey("can_stattrack_swap");
+        if (canStatTrakSwap)
+        {
+            info.m_canStatTrakSwap = FromString<int>(canStatTrakSwap->String()) != 0;
+        }
+    }
+
+    const KeyValue *tool = itemKey.GetSubkey("tool");
+    if (tool)
+    {
+        std::string_view restriction = tool->GetString("restriction");
+        if (restriction.size())
+        {
+            info.m_toolRestriction = restriction;
+        }
+    }
+
+    const KeyValue *attributes = itemKey.GetSubkey("attributes");
+    if (attributes)
+    {
+        info.m_prestigeYear = attributes->GetNumber<uint32_t>(
+            "prestige year", info.m_prestigeYear);
+
+        const KeyValue *supplyCrateSeries = attributes->GetSubkey("set supply crate series");
+        if (supplyCrateSeries)
+        {
+            info.m_supplyCrateSeries = supplyCrateSeries->GetNumber<uint32_t>("value");
+        }
+
+        auto parseTournamentAttribute = [&](std::string_view name, uint32_t &value)
+        {
+            const KeyValue *attribute = attributes->GetSubkey(name);
+            if (attribute)
+            {
+                value = attribute->GetNumber<uint32_t>("value");
+            }
+        };
+
+        parseTournamentAttribute("tournament event id", info.m_tournament.eventId);
+        parseTournamentAttribute("tournament event stage id", info.m_tournament.stageId);
+        parseTournamentAttribute("tournament event team0 id", info.m_tournament.team0Id);
+        parseTournamentAttribute("tournament event team1 id", info.m_tournament.team1Id);
+        parseTournamentAttribute("tournament mvp account id", info.m_tournament.mvpAccountId);
+
+        for (const KeyValue &attribute : *attributes)
+        {
+            if (!attribute.GetNumber<int>("force_gc_to_generate"))
+            {
+                continue;
+            }
+
+            auto defIndex = m_attributeDefIndexByName.find(std::string{ attribute.Name() });
+            if (defIndex == m_attributeDefIndexByName.end())
+            {
+                Platform::Print("Unknown generated attribute '%s' for item %u\n",
+                    std::string{ attribute.Name() }.c_str(), info.m_defIndex);
+                continue;
+            }
+
+            const std::string value{ attribute.GetString("value") };
+            auto existing = std::find_if(info.m_generatedAttributes.begin(),
+                info.m_generatedAttributes.end(), [&](const GeneratedItemAttribute &generated) {
+                    return generated.defIndex == defIndex->second;
+                });
+            if (existing != info.m_generatedAttributes.end())
+            {
+                existing->value = value;
+            }
+            else
+            {
+                info.m_generatedAttributes.push_back({ defIndex->second, value });
+            }
+        }
+    }
+}
+
+void ItemSchema::ParseAttributes(const KeyValue *attributesKey)
+{
+    m_attributeInfo.reserve(attributesKey->SubkeyCount());
+
+    for (const KeyValue &attributeKey : *attributesKey)
+    {
+        uint32_t defIndex = FromString<uint32_t>(attributeKey.Name());
+        assert(defIndex);
+        m_attributeInfo.try_emplace(defIndex, attributeKey);
+
+        std::string_view name = attributeKey.GetString("name");
+        if (!name.empty())
+        {
+            m_attributeDefIndexByName[std::string{ name }] = defIndex;
+        }
+    }
+}
+
+void ItemSchema::ParseStickerKits(const KeyValue *stickerKitsKey)
+{
+    m_stickerKitInfo.reserve(stickerKitsKey->SubkeyCount());
+
+    for (const KeyValue &stickerKitKey : *stickerKitsKey)
+    {
+        std::string_view name = stickerKitKey.GetString("name");
+
+        m_stickerKitInfo.emplace(std::piecewise_construct,
+            std::forward_as_tuple(name),
+            std::forward_as_tuple(stickerKitKey));
+    }
+}
+
+void ItemSchema::ParsePaintKits(const KeyValue *paintKitsKey)
+{
+    m_paintKitInfo.reserve(paintKitsKey->SubkeyCount());
+
+    float defaultMinFloat = 0.0f;
+    float defaultMaxFloat = 1.0f;
+    if (const KeyValue *defaultPaintKitKey = paintKitsKey->GetSubkey("0"))
+    {
+        defaultMinFloat = defaultPaintKitKey->GetNumber<float>("wear_remap_min", defaultMinFloat);
+        defaultMaxFloat = defaultPaintKitKey->GetNumber<float>("wear_remap_max", defaultMaxFloat);
+    }
+
+    for (const KeyValue &paintKitKey : *paintKitsKey)
+    {
+        std::string_view name = paintKitKey.GetString("name");
+
+        m_paintKitInfo.emplace(std::piecewise_construct,
+            std::forward_as_tuple(name),
+            std::forward_as_tuple(paintKitKey, defaultMinFloat, defaultMaxFloat));
+    }
+}
+
+void ItemSchema::ParseItemSets(const KeyValue *itemSetsKey)
+{
+    m_itemSets.reserve(itemSetsKey->SubkeyCount());
+
+    for (const KeyValue &itemSetKey : *itemSetsKey)
+    {
+        ItemSet itemSet;
+        itemSet.name = std::string{ itemSetKey.GetString("name", itemSetKey.Name()) };
+        itemSet.isCollection = itemSetKey.GetNumber("is_collection", false);
+
+        const KeyValue *itemsKey = itemSetKey.GetSubkey("items");
+        if (itemsKey)
+        {
+            itemSet.items.reserve(itemsKey->SubkeyCount());
+            for (const KeyValue &itemKey : *itemsKey)
+            {
+                LootListItem item;
+                if (ParseLootListItem(item, itemKey.Name()))
+                {
+                    itemSet.items.push_back(item);
+                }
+            }
+        }
+
+        m_itemSets.emplace(std::piecewise_construct,
+            std::forward_as_tuple(itemSetKey.Name()),
+            std::forward_as_tuple(std::move(itemSet)));
+    }
+}
+
+void ItemSchema::ParsePaintKitRarities(const KeyValue *raritiesKey)
+{
+    for (const KeyValue &key : *raritiesKey)
+    {
+        PaintKitInfo *paintKitInfo = PaintKitInfoByName(key.Name());
+        if (!paintKitInfo)
+        {
+            continue;
+        }
+
+        assert(paintKitInfo->m_rarity == RarityCommon);
+        paintKitInfo->m_rarity = ItemRarityFromString(key.String());
+    }
+}
+
+void ItemSchema::ParseMusicDefinitions(const KeyValue *musicDefinitionsKey)
+{
+    m_musicDefinitionInfo.reserve(musicDefinitionsKey->SubkeyCount());
+
+    for (const KeyValue &musicDefinitionKey : *musicDefinitionsKey)
+    {
+        std::string_view name = musicDefinitionKey.GetString("name");
+
+        m_musicDefinitionInfo.emplace(std::piecewise_construct,
+            std::forward_as_tuple(name),
+            std::forward_as_tuple(musicDefinitionKey));
+    }
+}
+
+static void ParseAttributeAndItemName(std::string_view input, std::string_view &attribute, std::string_view &item)
+{
+    // fallbacks (mikkotodo unfuck)
+    attribute = {};
+    item = input;
+
+    if (input[0] != '[')
+        return;
+
+    size_t attribEnd = input.find(']', 1);
+    if (attribEnd == std::string_view::npos)
+    {
+        assert(false);
+        return;
+    }
+
+    attribute = input.substr(1, attribEnd - 1);
+    item = input.substr(attribEnd + 1);
+
+    assert(attribute.size() && item.size());
+}
+
+static LootListItemType LootListItemTypeFromName(std::string_view name, std::string_view attributeName)
+{
+    if (attributeName.empty())
+    {
+        return LootListItemNoAttribute;
+    }
+
+    const std::pair<std::string_view, LootListItemType> mapNames[] = {
+        { "sticker", LootListItemSticker },
+        { "spray", LootListItemSpray },
+        { "patch", LootListItemPatch },
+        { "musickit", LootListItemMusicKit }
+    };
+
+    for (const auto &pair : mapNames)
+    {
+        if (pair.first == name)
+        {
+            return pair.second;
+        }
+    }
+
+    return LootListItemPaintable;
+}
+
+void ItemSchema::ParseLootLists(const KeyValue *lootListsKey, bool unusual)
+{
+    m_lootLists.reserve(m_lootLists.size() + lootListsKey->SubkeyCount());
+
+    for (const KeyValue &lootListKey : *lootListsKey)
+    {
+        auto emplace = m_lootLists.emplace(std::piecewise_construct,
+            std::forward_as_tuple(lootListKey.Name()),
+            std::forward_as_tuple());
+
+        if (!emplace.second)
+        {
+            Platform::Print("Duplicate loot list %s ignored\n", std::string{ lootListKey.Name() }.c_str());
+            continue;
+        }
+
+        LootList &lootList = emplace.first->second;
+        lootList.isUnusual = unusual;
+
+        for (const KeyValue &entryKey : lootListKey)
+        {
+            std::string_view entryName = entryKey.Name();
+
+            // Supplemental GC loot lists can reuse collections from
+            // items_game.txt instead of duplicating every painted item.
+            if (entryName == "item_sets")
+            {
+                for (const KeyValue &itemSetKey : entryKey)
+                {
+                    auto itemSetSearch = m_itemSets.find(std::string{ itemSetKey.Name() });
+                    if (itemSetSearch == m_itemSets.end())
+                    {
+                        Platform::Print("Loot list %s references missing item set %s\n",
+                            std::string{ lootListKey.Name() }.c_str(),
+                            std::string{ itemSetKey.Name() }.c_str());
+                        continue;
+                    }
+
+                    for (LootListItem item : itemSetSearch->second.items)
+                    {
+                        if (unusual)
+                        {
+                            item.quality = QualityUnusual;
+                        }
+
+                        lootList.items.push_back(item);
+                    }
+                }
+
+                continue;
+            }
+
+            // check for options that we ignore
+            if (entryName == "will_produce_stattrak")
+            {
+                lootList.willProduceStatTrak = true;
+                continue;
+            }
+
+            // check for options that we ignore
+            if (entryName == "all_entries_as_additional_drops"
+                || entryName == "contains_patches_representing_organizations"
+                || entryName == "contains_stickers_autographed_by_proplayers"
+                || entryName == "contains_stickers_representing_organizations"
+                || entryName == "limit_description_to_number_rnd"
+                || entryName == "public_list_contents")
+            {
+                continue;
+            }
+
+            std::string entryNameKey{ entryKey.Name() };
+
+            // check if it's another loot list
+            auto listSearch = m_lootLists.find(entryNameKey);
+            if (listSearch != m_lootLists.end())
+            {
+                lootList.subLists.push_back(&listSearch->second);
+                continue;
+            }
+
+            // check for an item
+            LootListItem item;
+            if (ParseLootListItem(item, entryName))
+            {
+                if (unusual)
+                {
+                    // override the quality here...
+                    item.quality = QualityUnusual;
+                }
+
+                lootList.items.push_back(item);
+            }
+            else
+            {
+                // what the fuck is this...
+                Platform::Print("Unhandled loot list entry %s!!!!\n", entryNameKey.c_str());
+            }
+        }
+    }
+}
+
+static uint32_t PaintedItemRarity(uint32_t itemRarity, uint32_t paintKitRarity)
+{
+    int rarity = (itemRarity - 1) + paintKitRarity;
+    if (rarity < 0)
+    {
+        return 0;
+    }
+
+    if (rarity > ItemSchema::RarityAncient)
+    {
+        if (paintKitRarity == ItemSchema::RarityImmortal)
+        {
+            return ItemSchema::RarityImmortal;
+        }
+
+        return ItemSchema::RarityAncient;
+    }
+
+    return rarity;
+}
+
+// mikkotodo rewrite this function
+bool ItemSchema::ParseLootListItem(LootListItem &item, std::string_view name)
+{
+    // check for an attribute + item combo
+    std::string_view attributeName, itemName;
+    ParseAttributeAndItemName(name, attributeName, itemName);
+
+    const ItemInfo *itemInfo = ItemInfoByName(itemName);
+    if (!itemInfo)
+    {
+        Platform::Print("No such item %s!!!\n", std::string{ itemName }.c_str());
+        return false;
+    }
+
+    item.itemInfo = itemInfo;
+    item.type = LootListItemTypeFromName(itemName, attributeName);
+
+    // until proven otherwise...
+    item.rarity = itemInfo->m_rarity;
+    item.quality = itemInfo->m_quality;
+
+    if (item.type == LootListItemNoAttribute)
+    {
+        // no attribute
+    }
+    else if (item.type == LootListItemSticker || item.type == LootListItemSpray || item.type == LootListItemPatch)
+    {
+        // the attribute is the sticker name
+        item.stickerKitInfo = MutableStickerKitInfoByName(attributeName);
+        if (!item.stickerKitInfo)
+        {
+            Platform::Print("WARNING: No such sticker kit %s\n", std::string{ attributeName }.c_str());
+            return false;
+        }
+
+        // sticker kits affect the item rarity (mikkotodo how do these work, something like PaintedItemRarity???)
+        assert(itemInfo->m_rarity == 1);
+
+        if (item.stickerKitInfo->m_rarity)
+        {
+            item.rarity = item.stickerKitInfo->m_rarity;
+        }
+    }
+    else if (item.type == LootListItemMusicKit)
+    {
+        // the attribute is the music definition name
+        item.musicDefinitionInfo = MusicDefinitionInfoByName(attributeName);
+        if (!item.musicDefinitionInfo)
+        {
+            Platform::Print("WARNING: No such music definition %s\n", std::string{ attributeName }.c_str());
+            return false;
+        }
+    }
+    else
+    {
+        // probably a paint kit
+        assert(item.type == LootListItemPaintable);
+        item.paintKitInfo = PaintKitInfoByName(attributeName);
+        if (!item.paintKitInfo)
+        {
+            assert(false);
+            Platform::Print("WARNING: No such paint kit %s\n", std::string{ attributeName }.c_str());
+            return false;
+        }
+
+        // paint kits affect the item rarity
+        item.rarity = PaintedItemRarity(itemInfo->m_rarity, item.paintKitInfo->m_rarity);
+    }
+
+    return true;
+}
+
+void ItemSchema::ParseRevolvingLootLists(const KeyValue *revolvingLootListsKey)
+{
+    m_revolvingLootLists.reserve(revolvingLootListsKey->SubkeyCount());
+
+    for (const KeyValue &revolvingLootListKey : *revolvingLootListsKey)
+    {
+        uint32_t index = FromString<uint32_t>(revolvingLootListKey.Name());
+        assert(index);
+
+        // ugh
+        std::string lootListName = std::string{ revolvingLootListKey.String() };
+
+        auto it = m_lootLists.find(lootListName);
+        if (it == m_lootLists.end())
+        {
+            continue;
+        }
+
+        m_revolvingLootLists.try_emplace(index, it->second);
+    }
+}
+
+const ItemInfo *ItemSchema::ItemInfoByName(std::string_view name) const
+{
+    auto defIndex = m_itemDefIndexByName.find(std::string{ name });
+    if (defIndex == m_itemDefIndexByName.end())
+    {
+        return nullptr;
+    }
+
+    return ItemInfoByDefIndex(defIndex->second);
+}
+
+const ItemInfo *ItemSchema::ItemInfoByDefIndex(uint32_t defIndex) const
+{
+    auto it = m_itemInfo.find(defIndex);
+    if (it == m_itemInfo.end())
+    {
+        return nullptr;
+    }
+
+    return &it->second;
+}
+
+std::optional<TournamentAccessInfo> ItemSchema::TournamentAccessByDefIndex(uint32_t defIndex) const
+{
+    const ItemInfo *accessItem = ItemInfoByDefIndex(defIndex);
+    if (!accessItem || !accessItem->m_tournament.eventId
+        || !accessItem->m_name.starts_with("tournament_pass_"))
+    {
+        return std::nullopt;
+    }
+
+    if (std::find(accessItem->m_prefabs.begin(), accessItem->m_prefabs.end(), "fan_token")
+        == accessItem->m_prefabs.end())
+    {
+        return std::nullopt;
+    }
+
+    TournamentAccessInfo result;
+    result.eventId = accessItem->m_tournament.eventId;
+
+    std::string_view suffix = std::string_view{ accessItem->m_name }.substr(
+        std::string_view{ "tournament_pass_" }.size());
+    if (suffix.ends_with("_charge"))
+    {
+        result.type = TournamentAccessType::Token;
+        suffix.remove_suffix(std::string_view{ "_charge" }.size());
+    }
+    else if (suffix.ends_with("_pack"))
+    {
+        result.type = TournamentAccessType::PassWithTokens;
+        result.includedTokens = 3;
+        suffix.remove_suffix(std::string_view{ "_pack" }.size());
+    }
+    else
+    {
+        result.type = TournamentAccessType::Pass;
+    }
+
+    const std::string journalName = std::string{ "tournament_journal_" } + std::string{ suffix };
+    const ItemInfo *journal = ItemInfoByName(journalName);
+    if (!journal || journal->m_tournament.eventId != result.eventId
+        || std::find(journal->m_prefabs.begin(), journal->m_prefabs.end(), "fan_shield")
+            == journal->m_prefabs.end())
+    {
+        return std::nullopt;
+    }
+
+    result.journalDefIndex = journal->m_defIndex;
+    return result;
+}
+
+StickerKitInfo *ItemSchema::MutableStickerKitInfoByName(std::string_view name)
+{
+    auto it = m_stickerKitInfo.find(std::string{ name });
+    if (it == m_stickerKitInfo.end())
+    {
+        assert(false);
+        return nullptr;
+    }
+
+    return &it->second;
+}
+
+const StickerKitInfo *ItemSchema::FindStickerKitInfoByName(std::string_view name) const
+{
+    auto it = m_stickerKitInfo.find(std::string{ name });
+    if (it == m_stickerKitInfo.end())
+    {
+        return nullptr;
+    }
+
+    return &it->second;
+}
+
+std::vector<const StickerKitInfo *> ItemSchema::TournamentStickerKits(
+    TournamentStickerRole role, uint32_t eventId, uint32_t subjectId) const
+{
+    std::vector<const StickerKitInfo *> result;
+    for (const auto &pair : m_stickerKitInfo)
+    {
+        const StickerKitInfo &info = pair.second;
+        if (info.m_tournamentEventId != eventId)
+        {
+            continue;
+        }
+
+        bool matchesRole = false;
+        switch (role)
+        {
+        case TournamentStickerRole::Event:
+            matchesRole = info.m_tournamentTeamId == 0 && info.m_tournamentPlayerId == 0;
+            break;
+
+        case TournamentStickerRole::Team:
+            matchesRole = info.m_tournamentTeamId == subjectId && info.m_tournamentPlayerId == 0;
+            break;
+
+        case TournamentStickerRole::Player:
+            matchesRole = info.m_tournamentPlayerId == subjectId;
+            break;
+        }
+
+        if (matchesRole)
+        {
+            result.push_back(&info);
+        }
+    }
+
+    return result;
+}
+
+const StickerKitInfo *ItemSchema::StickerKitInfoByDefIndex(uint32_t defIndex) const
+{
+    for (const auto &pair : m_stickerKitInfo)
+    {
+        if (pair.second.m_defIndex == defIndex)
+        {
+            return &pair.second;
+        }
+    }
+
+    return nullptr;
+}
+
+PaintKitInfo *ItemSchema::PaintKitInfoByName(std::string_view name)
+{
+    auto it = m_paintKitInfo.find(std::string{ name });
+    if (it == m_paintKitInfo.end())
+    {
+        return nullptr;
+    }
+
+    return &it->second;
+}
+
+const PaintKitInfo *ItemSchema::PaintKitInfoByDefIndex(uint32_t defIndex) const
+{
+    for (const auto &pair : m_paintKitInfo)
+    {
+        if (pair.second.m_defIndex == defIndex)
+        {
+            return &pair.second;
+        }
+    }
+
+    return nullptr;
+}
+
+MusicDefinitionInfo *ItemSchema::MusicDefinitionInfoByName(std::string_view name)
+{
+    auto it = m_musicDefinitionInfo.find(std::string{ name });
+    if (it == m_musicDefinitionInfo.end())
+    {
+        assert(false);
+        return nullptr;
+    }
+
+    return &it->second;
+}
+
+const MusicDefinitionInfo *ItemSchema::MusicDefinitionInfoByDefIndex(uint32_t defIndex) const
+{
+    for (const auto &pair : m_musicDefinitionInfo)
+    {
+        if (pair.second.m_defIndex == defIndex)
+        {
+            return &pair.second;
+        }
+    }
+
+    return nullptr;
+}
+
+bool ItemSchema::GetCollectionsForPaintedItem(uint32_t defIndex, uint32_t paintKitDefIndex,
+    std::vector<std::string> &outCollections) const
+{
+    outCollections.clear();
+
+    for (const auto &pair : m_itemSets)
+    {
+        const ItemSet &itemSet = pair.second;
+        if (!itemSet.isCollection)
+        {
+            continue;
+        }
+
+        for (const LootListItem &item : itemSet.items)
+        {
+            if (!item.itemInfo || !item.paintKitInfo)
+            {
+                continue;
+            }
+
+            if (item.itemInfo->m_defIndex == defIndex && item.paintKitInfo->m_defIndex == paintKitDefIndex)
+            {
+                outCollections.push_back(pair.first);
+                break;
+            }
+        }
+    }
+
+    return !outCollections.empty();
+}
+
+bool ItemSchema::GetCollectionsForPaintKit(uint32_t paintKitDefIndex,
+    std::vector<std::string> &outCollections) const
+{
+    outCollections.clear();
+
+    for (const auto &pair : m_itemSets)
+    {
+        const ItemSet &itemSet = pair.second;
+        if (!itemSet.isCollection)
+        {
+            continue;
+        }
+
+        for (const LootListItem &item : itemSet.items)
+        {
+            if (!item.paintKitInfo)
+            {
+                continue;
+            }
+
+            if (item.paintKitInfo->m_defIndex == paintKitDefIndex)
+            {
+                outCollections.push_back(pair.first);
+                break;
+            }
+        }
+    }
+
+    return !outCollections.empty();
+}
+
+std::string ItemSchema::GetCollectionDisplayName(std::string_view collectionName) const
+{
+    auto it = m_itemSets.find(std::string{ collectionName });
+    if (it == m_itemSets.end())
+    {
+        return std::string{ collectionName };
+    }
+
+    if (it->second.name.empty())
+    {
+        return std::string{ collectionName };
+    }
+
+    return it->second.name;
+}
+
+bool ItemSchema::GetTradeUpCandidates(std::string_view collectionName, uint32_t outputRarity,
+    std::vector<const LootListItem *> &outCandidates) const
+{
+    outCandidates.clear();
+
+    auto it = m_itemSets.find(std::string{ collectionName });
+    if (it == m_itemSets.end())
+    {
+        return false;
+    }
+
+    const ItemSet &itemSet = it->second;
+    for (const LootListItem &item : itemSet.items)
+    {
+        if (item.type != LootListItemPaintable)
+        {
+            continue;
+        }
+
+        if (!item.itemInfo || !item.paintKitInfo)
+        {
+            continue;
+        }
+
+        if (item.rarity == outputRarity)
+        {
+            outCandidates.push_back(&item);
+        }
+    }
+
+    return !outCandidates.empty();
+}
+
+uint32_t ItemSchema::GetPaintedRarity(uint32_t defIndex, uint32_t paintKitDefIndex, uint32_t fallbackRarity) const
+{
+    const ItemInfo *itemInfo = ItemInfoByDefIndex(defIndex);
+    const PaintKitInfo *paintKitInfo = PaintKitInfoByDefIndex(paintKitDefIndex);
+
+    if (!itemInfo || !paintKitInfo)
+    {
+        return fallbackRarity;
+    }
+
+    return PaintedItemRarity(itemInfo->m_rarity, paintKitInfo->m_rarity);
+}
+
+static char LowerAscii(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+    {
+        return c - 'A' + 'a';
+    }
+
+    return c;
+}
+
+static bool ContainsInsensitive(std::string_view haystack, std::string_view needle)
+{
+    if (needle.empty() || haystack.size() < needle.size())
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i <= haystack.size() - needle.size(); i++)
+    {
+        bool match = true;
+        for (size_t j = 0; j < needle.size(); j++)
+        {
+            if (LowerAscii(haystack[i + j]) != LowerAscii(needle[j]))
+            {
+                match = false;
+                break;
+            }
+        }
+
+        if (match)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool EqualsInsensitive(std::string_view left, std::string_view right)
+{
+    if (left.size() != right.size())
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i < left.size(); i++)
+    {
+        if (LowerAscii(left[i]) != LowerAscii(right[i]))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool ItemInfoContains(const ItemInfo &info, std::string_view text)
+{
+    if (ContainsInsensitive(info.m_name, text) || ContainsInsensitive(info.m_itemType, text))
+    {
+        return true;
+    }
+
+    for (const std::string &prefab : info.m_prefabs)
+    {
+        if (ContainsInsensitive(prefab, text))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ItemInfoMatchesIdentifier(const ItemInfo &info, std::string_view text)
+{
+    if (EqualsInsensitive(info.m_name, text) || EqualsInsensitive(info.m_itemType, text))
+    {
+        return true;
+    }
+
+    for (const std::string &prefab : info.m_prefabs)
+    {
+        if (EqualsInsensitive(prefab, text))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool ItemSchema::IsKeyToolDefIndex(uint32_t defIndex) const
+{
+    const ItemInfo *info = ItemInfoByDefIndex(defIndex);
+    if (!info)
+    {
+        return false;
+    }
+
+    return ItemInfoMatchesIdentifier(*info, "weapon_case_key")
+        || ItemInfoMatchesIdentifier(*info, "weaponcasekey")
+        || ItemInfoMatchesIdentifier(*info, "#CSGO_Type_WeaponCaseKey")
+        || ItemInfoMatchesIdentifier(*info, "CSGO_Type_WeaponCaseKey");
+}
+
+bool ItemSchema::IsNameTagToolDefIndex(uint32_t defIndex) const
+{
+    const ItemInfo *info = ItemInfoByDefIndex(defIndex);
+    if (!info)
+    {
+        return false;
+    }
+
+    return ItemInfoContains(*info, "name tag")
+        || ItemInfoContains(*info, "name_tag")
+        || ItemInfoContains(*info, "nametag");
+}
+
+bool ItemSchema::IsStatTrakSwapToolDefIndex(uint32_t defIndex) const
+{
+    const ItemInfo *info = ItemInfoByDefIndex(defIndex);
+    if (!info)
+    {
+        return false;
+    }
+
+    return ItemInfoContains(*info, "stattrak")
+        && ItemInfoContains(*info, "swap");
+}
+
+bool ItemSchema::IsKeyCompatibleWithCrate(uint32_t keyDefIndex, uint32_t crateDefIndex) const
+{
+    const ItemInfo *keyInfo = ItemInfoByDefIndex(keyDefIndex);
+    const ItemInfo *crateInfo = ItemInfoByDefIndex(crateDefIndex);
+    if (!keyInfo || !crateInfo)
+    {
+        return false;
+    }
+
+    if (keyInfo->m_toolRestriction.empty() || crateInfo->m_toolRestriction.empty())
+    {
+        return true;
+    }
+
+    return keyInfo->m_toolRestriction == crateInfo->m_toolRestriction;
+}
+
+bool ItemSchema::CanApplyStickerToDefIndex(uint32_t defIndex) const
+{
+    const ItemInfo *info = ItemInfoByDefIndex(defIndex);
+    return info && info->m_canSticker;
+}
+
+bool ItemSchema::CanApplyPatchToDefIndex(uint32_t defIndex) const
+{
+    const ItemInfo *info = ItemInfoByDefIndex(defIndex);
+    return info && info->m_canPatch;
+}
+
+bool ItemSchema::CanNameDefIndex(uint32_t defIndex) const
+{
+    const ItemInfo *info = ItemInfoByDefIndex(defIndex);
+    return info && info->m_nameable;
+}
+
+bool ItemSchema::CanStatTrakSwapDefIndex(uint32_t defIndex) const
+{
+    const ItemInfo *info = ItemInfoByDefIndex(defIndex);
+    return info && info->m_canStatTrakSwap;
+}
+
+std::vector<uint32_t> ItemSchema::PrestigeMedalDefIndexes(uint32_t year) const
+{
+    std::vector<uint32_t> defIndexes;
+    for (const auto &[defIndex, info] : m_itemInfo)
+    {
+        if (info.m_itemType == "prestige_coin" && info.m_prestigeYear == year)
+        {
+            defIndexes.push_back(defIndex);
+        }
+    }
+
+    std::sort(defIndexes.begin(), defIndexes.end());
+    return defIndexes;
+}

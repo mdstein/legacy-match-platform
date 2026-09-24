@@ -1,0 +1,131 @@
+name: aftertick
+
+services:
+  postgres:
+    image: postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set the production database name}
+      POSTGRES_USER: ${POSTGRES_USER:?Set the production database user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set the production database password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    image: redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set the production Redis password}
+    command:
+      - sh
+      - -c
+      - exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  migrate:
+    image: ${AFTERTICK_API_IMAGE:?Set an immutable API image digest}
+    env_file: ${AFTERTICK_MIGRATION_ENV_FILE:?Set the migration environment file}
+    command: ["node", "apps/api/dist/migrate.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["ops"]
+    restart: "no"
+
+  seed:
+    image: ${AFTERTICK_API_IMAGE:?Set an immutable API image digest}
+    env_file: ${AFTERTICK_MIGRATION_ENV_FILE:?Set the migration environment file}
+    command: ["node", "apps/api/dist/seed.js"]
+    profiles: ["ops"]
+    restart: "no"
+
+  retention:
+    image: ${AFTERTICK_API_IMAGE:?Set an immutable API image digest}
+    env_file: ${AFTERTICK_DEPLOY_ENV_FILE:?Set the runtime environment file}
+    command: ["node", "apps/api/dist/retention.js"]
+    profiles: ["ops"]
+    restart: "no"
+
+  api:
+    image: ${AFTERTICK_API_IMAGE:?Set an immutable API image digest}
+    env_file: ${AFTERTICK_DEPLOY_ENV_FILE:?Set the runtime environment file}
+    init: true
+    restart: unless-stopped
+    expose:
+      - "8787"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+
+  web:
+    image: ${AFTERTICK_WEB_IMAGE:?Set an immutable web image digest}
+    depends_on:
+      api:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${AFTERTICK_BIND_ADDRESS:-127.0.0.1}:${AFTERTICK_HTTP_PORT:-8080}:8080"
+    security_opt:
+      - no-new-privileges:true
+
+  cloudflared:
+    image: ${AFTERTICK_CLOUDFLARED_IMAGE:?Set an immutable cloudflared image digest}
+    command: ["tunnel", "--metrics", "0.0.0.0:20241", "--no-autoupdate", "run", "--token-file", "/run/secrets/cloudflared-token"]
+    depends_on:
+      web:
+        condition: service_started
+    user: "0:0"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    ports:
+      - "127.0.0.1:${AFTERTICK_CLOUDFLARED_METRICS_PORT:-20241}:20241"
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:20241", "ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: ${AFTERTICK_TUNNEL_TOKEN_FILE:?Set the protected tunnel token file}
+        target: /run/secrets/cloudflared-token
+        read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+volumes:
+  postgres-data:
+  redis-data:

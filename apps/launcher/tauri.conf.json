@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "B2G Launcher",
+  "identifier": "net.back2go.launcher",
+  "build": { "frontendDist": "dist" },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "B2G Launcher",
+        "width": 1360,
+        "height": 820,
+        "minWidth": 960,
+        "minHeight": 640,
+        "decorations": false,
+        "backgroundColor": "#080a08",
+        "visible": false,
+        "dataDirectory": "B2G/webview"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://play.back2go.net https://community.fastly.steamstatic.com https://community.akamai.steamstatic.com; font-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; base-uri 'none'",
+      "capabilities": [
+        {
+          "identifier": "main-window",
+          "windows": ["main"],
+          "permissions": [
+            "core:event:default",
+            "core:window:allow-minimize",
+            "core:window:allow-toggle-maximize",
+            "core:window:allow-close",
+            "core:window:allow-start-dragging",
+            "core:window:allow-is-maximized",
+            "core:window:allow-show"
+          ]
+        }
+      ]
+    }
+  },
+  "bundle": { "active": false }
+}

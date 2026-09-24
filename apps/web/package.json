@@ -1,0 +1,31 @@
+{
+  "name": "@aftertick/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --configLoader native",
+    "build": "tsc -p tsconfig.json --noEmit && vite build --configLoader native",
+    "build:e2e": "tsc -p tsconfig.json --noEmit && vite build --mode e2e --configLoader native",
+    "preview": "vite preview --host 127.0.0.1 --configLoader native",
+    "preview:e2e": "vite preview --host 127.0.0.1 --config vite.e2e.config.mjs --configLoader native",
+    "typecheck": "tsc -p tsconfig.json --noEmit --pretty false"
+  },
+  "dependencies": {
+    "@aftertick/contracts": "*",
+    "@aftertick/rating": "*",
+    "@fontsource/barlow": "^5.2.6",
+    "@fontsource/barlow-condensed": "^5.2.6",
+    "@fontsource/encode-sans-expanded": "^5.3.0",
+    "@fontsource/unbounded": "^5.3.0",
+    "lucide-react": "^0.542.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.2",
+    "vite": "^7.1.3"
+  }
+}

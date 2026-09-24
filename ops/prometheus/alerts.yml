@@ -1,0 +1,66 @@
+groups:
+  - name: aftertick-platform
+    rules:
+      - alert: AftertickApiDown
+        expr: up{job="aftertick-api"} == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "Aftertick API metrics endpoint is unreachable"
+          runbook: "docs/runbooks/api-unavailable.md"
+
+      - alert: AftertickHighErrorRate
+        expr: sum(rate(aftertick_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(aftertick_http_requests_total[5m])), 1) > 0.05
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "Aftertick API 5xx rate exceeds 5%"
+          runbook: "docs/runbooks/api-unavailable.md"
+
+      - alert: AftertickHighLatency
+        expr: histogram_quantile(0.95, sum by (le) (rate(aftertick_http_request_duration_seconds_bucket[5m]))) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Aftertick API p95 latency exceeds one second"
+          runbook: "docs/runbooks/api-unavailable.md"
+
+      - alert: AftertickNoHealthyGameNodes
+        expr: aftertick_active_matches > 0 and aftertick_healthy_nodes == 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "Active matches exist with no recently healthy game node"
+          runbook: "docs/runbooks/game-node-unavailable.md"
+
+      - alert: AftertickQueueBacklog
+        expr: aftertick_queue_tickets > 100
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 100 queue tickets are waiting"
+          runbook: "docs/runbooks/matchmaking-backlog.md"
+
+      - alert: AftertickInvalidDemoEvidence
+        expr: aftertick_invalid_demos > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "At least one canonical GOTV artifact failed validation"
+          runbook: "docs/runbooks/demo-integrity.md"
+
+      - alert: AftertickModerationBacklog
+        expr: aftertick_pending_reports > 50
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "The moderation report backlog exceeds 50"
+          runbook: "docs/runbooks/moderation-backlog.md"
+
+      - alert: AftertickMatchRecoveryPending
+        expr: aftertick_open_recovery_incidents > 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "A failed live match requires an operator remake or void decision"
+          runbook: "docs/runbooks/game-node-unavailable.md"

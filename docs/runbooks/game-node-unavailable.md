@@ -1,0 +1,13 @@
+# No healthy game nodes
+
+1. If the failure is systemic, disable new server allocation in the admin console while capacity is repaired. Existing queue tickets may remain.
+2. Inspect node heartbeat age, instance state, the redacted `srcdsHealth` failure count/timestamps, command retry count, last error, and fenced lease ownership. Three authenticated consecutive RCON failures bound to the active match/lease immediately expire the fence with `srcds_unreachable`; lease TTL expiry remains the fallback when the entire agent or host disappears. Both paths quarantine the instance, preserve match/event/demo records, move a live match to `disputed`, open one recovery incident, and page on `AftertickMatchRecoveryPending`.
+3. Quarantine any additional instance that reports an unknown process, version mismatch, conflicting lease, or failed drain. Never reuse its old fencing token.
+4. Restart SRCDS and the node agent only after collecting the failed process output and partial GOTV file. Verify a fresh heartbeat and zero RCON failures, run `npm run game:server:smoke`, and confirm at least one ready spare instance before attempting a remake. Re-enable allocation if it was paused; the remake endpoint honors the allocation kill switch.
+5. Open **Platform operations → Recovery**. Review the incident, preserved lease signature/server metadata, match events, GOTV state, and any moderation hold. Record a specific operator finding.
+6. Choose **Void without rating** when competitive integrity cannot be restored. This terminally cancels the original match, creates no rating ledger entries, and writes an immutable `match.recovery.voided` audit record.
+7. Choose **Remake on new server** when the roster should replay. This creates exactly one new pending match with the same season/map/region/ruleset/teams, fresh credentials, demo destination and fenced lease, then atomically replaces active Redis assignments and publishes a new `match.assigned` event. The original becomes cancelled without rating.
+8. A `503` capacity response leaves the incident durably `resolving`; restore capacity and press **Retry remake**. It resumes the same replacement match and cannot allocate duplicates. If assignment delivery is below 10/10, use the displayed replacement details for manual handoff and retry after Redis is healthy.
+9. Keep the failed instance quarantined until its process, old password/config, GOTV finalization, and command queue have been reconciled. Watch the replacement through normal lease release and attach trace/audit IDs to the external incident record.
+
+Exact score/economy restoration is intentionally unavailable in the private alpha. Never settle, rate, or reuse a partially played failed match merely to avoid a replay.

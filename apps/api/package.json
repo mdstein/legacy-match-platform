@@ -1,0 +1,45 @@
+{
+  "name": "@aftertick/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsup --config tsup.config.ts",
+    "migrate:production": "node dist/migrate.js",
+    "seed:production": "node dist/seed.js",
+    "retention:dry-run": "tsx src/retention.ts",
+    "retention:apply": "tsx src/retention.ts --apply",
+    "start": "node ../../scripts/start-observed-api.mjs",
+    "start:preview": "node preview.mjs",
+    "start:e2e": "node e2e.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@aftertick/contracts": "*",
+    "@aftertick/db": "*",
+    "@aftertick/rating": "*",
+    "@aws-sdk/client-s3": "^3.1121.0",
+    "@csfloat/cs2-inspect-serializer": "^1.1.6",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/auto-instrumentations-node": "^0.79.0",
+    "connect-redis": "^10.0.0",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.7.0",
+    "express-session": "^1.19.0",
+    "postgres": "^3.4.5",
+    "rate-limit-redis": "^6.0.1",
+    "redis": "^6.2.1",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/express-session": "^1.19.0",
+    "@types/supertest": "^6.0.3",
+    "supertest": "^7.1.4",
+    "tsup": "^8.5.0",
+    "tsx": "^4.20.5"
+  }
+}

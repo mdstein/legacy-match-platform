@@ -1,0 +1,3074 @@
+#include "stdafx.h"
+#include "gc_client.h"
+#include "gc_message.h"
+#include "keyvalue.h"
+#include "launcher_bridge.h"
+#include "networking_client.h"
+#include "owned_inventory.h"
+#include "test_filesystem.h"
+
+#include <cstring>
+#include <cstdio>
+
+namespace Platform
+{
+
+void Print(const char *, ...)
+{
+}
+
+bool UpdateGraffitiKey(std::string_view, const void *, const void *, size_t)
+{
+    return true;
+}
+
+}
+
+S_API void S_CALLTYPE SteamAPI_RegisterCallback(CCallbackBase *, int)
+{
+}
+
+S_API void S_CALLTYPE SteamAPI_UnregisterCallback(CCallbackBase *)
+{
+}
+
+template<typename T>
+static bool ValueAt(const uint8_t *data, size_t offset, T expected)
+{
+    T actual{};
+    std::memcpy(&actual, data + offset, sizeof(actual));
+    return actual == expected;
+}
+
+static bool ExtendedCraftResponseSerialization()
+{
+    constexpr int16_t responseIndex = 12;
+    constexpr uint64_t craftedItemId = 0x1122334455667788ull;
+
+    GCMessageWrite message = BuildCraftResponseMessage(
+        responseIndex,
+        k_EGCMsgResponseOK,
+        craftedItemId);
+
+    const auto *data = static_cast<const uint8_t *>(message.Data());
+    size_t offset = 0;
+
+    bool valid = ValueAt(data, offset, static_cast<uint32_t>(k_EMsgGCCraftResponse));
+    offset += sizeof(uint32_t);
+    valid &= ValueAt(data, offset, uint32_t{ 0 });
+    offset += sizeof(uint32_t);
+    valid &= ValueAt(data, offset, uint64_t{ 0 });
+    offset += sizeof(uint64_t);
+    valid &= ValueAt(data, offset, uint16_t{ 1 });
+    offset += sizeof(uint16_t);
+    valid &= ValueAt(data, offset, JobIdInvalid);
+    offset += sizeof(uint64_t);
+    valid &= ValueAt(data, offset, JobIdInvalid);
+    offset += sizeof(uint64_t);
+    valid &= ValueAt(data, offset, responseIndex);
+    offset += sizeof(int16_t);
+    valid &= ValueAt(data, offset, static_cast<uint32_t>(k_EGCMsgResponseOK));
+    offset += sizeof(uint32_t);
+    valid &= ValueAt(data, offset, uint16_t{ 1 });
+    offset += sizeof(uint16_t);
+    valid &= ValueAt(data, offset, craftedItemId);
+    offset += sizeof(uint64_t);
+
+    return valid && offset == message.Size();
+}
+
+static bool TruncatedCraftRequestGetsInvalidResponse()
+{
+    constexpr int16_t recipe = -3;
+
+    GCMessageWrite request{ k_EMsgGCCraft };
+    request.WriteUint16(static_cast<uint16_t>(recipe));
+
+    ClientGC gc{ 76561197960265729ull };
+    gc.PostToGC(GCEvent::Message, k_EMsgGCCraft, request.Data(), request.Size());
+
+    std::vector<EventData> events;
+    EventData responseEvent;
+    bool foundResponse = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{ 1 };
+    while (!foundResponse && std::chrono::steady_clock::now() < deadline)
+    {
+        gc.GetHostEvents(events);
+        for (EventData &event : events)
+        {
+            if (event.type == static_cast<int>(HostEvent::Message)
+                && event.id == k_EMsgGCCraftResponse)
+            {
+                responseEvent = std::move(event);
+                foundResponse = true;
+                break;
+            }
+        }
+
+        events.clear();
+        if (!foundResponse)
+        {
+            std::this_thread::yield();
+        }
+    }
+
+    if (!foundResponse)
+    {
+        return false;
+    }
+
+    const auto *data = responseEvent.buffer.data();
+    constexpr size_t responseBodyOffset = sizeof(uint32_t) + sizeof(uint32_t)
+        + sizeof(uint64_t) + sizeof(uint16_t) + sizeof(uint64_t) + sizeof(uint64_t);
+
+    return ValueAt(data, responseBodyOffset, recipe)
+        && ValueAt(data, responseBodyOffset + sizeof(int16_t),
+            static_cast<uint32_t>(k_EGCMsgResponseInvalid))
+        && ValueAt(data, responseBodyOffset + sizeof(int16_t) + sizeof(uint32_t), uint16_t{ 0 })
+        && responseEvent.buffer.size()
+            == responseBodyOffset + sizeof(int16_t) + sizeof(uint32_t) + sizeof(uint16_t);
+}
+
+static bool BasicStructHeaderSerializationIsUnchanged()
+{
+    constexpr uint32_t messageType = 1;
+    GCMessageWrite message{ messageType };
+
+    const auto *data = static_cast<const uint8_t *>(message.Data());
+    size_t offset = 0;
+
+    bool valid = ValueAt(data, offset, messageType);
+    offset += sizeof(uint32_t);
+    valid &= ValueAt(data, offset, uint32_t{ 0 });
+    offset += sizeof(uint32_t);
+    valid &= ValueAt(data, offset, uint64_t{ 0 });
+    offset += sizeof(uint64_t);
+    valid &= ValueAt(data, offset, uint16_t{ 0 });
+    offset += sizeof(uint16_t);
+
+    return valid && offset == message.Size();
+}
+
+class TestSteamNetworkingMessages final : public ISteamNetworkingMessages
+{
+    struct TestMessage : SteamNetworkingMessage_t
+    {
+        TestMessage() : SteamNetworkingMessage_t() {}
+    };
+public:
+    ~TestSteamNetworkingMessages()
+    {
+        while (!incoming.empty()) { incoming.front()->Release(); incoming.pop(); }
+    }
+
+    void Enqueue(uint64_t sender, const GCMessageWrite &wire)
+    {
+        auto *message = new TestMessage{};
+        message->m_identityPeer.SetSteamID64(sender);
+        message->m_cbSize = wire.Size();
+        message->m_pData = new uint8_t[wire.Size()];
+        std::memcpy(message->m_pData, wire.Data(), wire.Size());
+        message->m_pfnRelease = [](SteamNetworkingMessage_t *value) {
+            delete[] static_cast<uint8_t *>(value->m_pData);
+            delete static_cast<TestMessage *>(value);
+        };
+        incoming.push(message);
+    }
+    EResult SendMessageToUser(const SteamNetworkingIdentity &, const void *, uint32,
+        int, int) override
+    {
+        return k_EResultOK;
+    }
+
+    int ReceiveMessagesOnChannel(int, SteamNetworkingMessage_t **message, int) override
+    {
+        ++receiveCalls;
+        if (incoming.empty()) return 0;
+        *message = incoming.front(); incoming.pop();
+        return 1;
+    }
+
+    bool AcceptSessionWithUser(const SteamNetworkingIdentity &) override
+    {
+        return true;
+    }
+
+    bool CloseSessionWithUser(const SteamNetworkingIdentity &) override
+    {
+        return true;
+    }
+
+    bool CloseChannelWithUser(const SteamNetworkingIdentity &, int) override
+    {
+        return true;
+    }
+
+    ESteamNetworkingConnectionState GetSessionConnectionInfo(
+        const SteamNetworkingIdentity &, SteamNetConnectionInfo_t *,
+        SteamNetworkingQuickConnectionStatus *) override
+    {
+        return k_ESteamNetworkingConnectionState_None;
+    }
+
+    int receiveCalls{};
+    std::queue<SteamNetworkingMessage_t *> incoming;
+};
+
+static bool NetworkingClientRefreshesInterfacesAndSkipsIdlePolling()
+{
+    TestSteamNetworkingMessages first;
+    TestSteamNetworkingMessages second;
+
+    NetworkingClient networking{ &first };
+    networking.Update(nullptr);
+
+    const uint8_t ticket = 1;
+    networking.SetAuthTicket(1, &ticket, sizeof(ticket));
+    networking.Update(nullptr);
+    networking.SetNetworkingMessages(&second);
+    networking.Update(nullptr);
+    networking.ClearAuthTicket(1);
+    networking.Update(nullptr);
+
+    return first.receiveCalls == 1 && second.receiveCalls == 1;
+}
+
+static bool ServerLoadoutRequestsArePeerBoundAndDoNotResetLocalInventory()
+{
+    TestSteamNetworkingMessages transport;
+    NetworkingClient networking{ &transport };
+    ClientGC gc{ 76561197960265729ull };
+    constexpr uint64_t serverId = 90000000000000001ull;
+    const uint8_t ticket[]{ 1, 2, 3, 4 };
+    networking.SetAuthTicket(1, ticket, sizeof(ticket));
+    // A malformed craft request is a deterministic FIFO barrier with no
+    // inventory side effect. Any other local message is a test failure.
+    const auto drain = [&](int expectedCaches) {
+        GCMessageWrite barrier{ k_EMsgGCCraft };
+        barrier.WriteUint16(static_cast<uint16_t>(-3));
+        gc.PostToGC(GCEvent::Message, barrier.TypeMasked(), barrier.Data(), barrier.Size());
+        std::vector<EventData> events;
+        int caches = 0;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{ 2 };
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            gc.GetHostEvents(events);
+            bool done = false;
+            for (const auto &event : events)
+            {
+                if (event.type == static_cast<int>(HostEvent::Message))
+                {
+                    if (event.id != k_EMsgGCCraftResponse) return false;
+                    done = true;
+                }
+                else if (event.type == static_cast<int>(HostEvent::NetMessage))
+                {
+                    GCMessageRead read{ 0, event.buffer.data(), static_cast<uint32_t>(event.buffer.size()) };
+                    CMsgSOCacheSubscribed cache;
+                    if (!read.IsValid() || !read.IsProtobuf() || read.TypeUnmasked() != k_ESOMsg_CacheSubscribed
+                        || !read.ReadProtobuf(cache)) return false;
+                    ++caches;
+                }
+                else return false;
+            }
+            if (done) return caches == expectedCaches;
+            events.clear();
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
+        }
+        return false;
+    };
+    GCMessageWrite request{ k_EMsgNetworkRequestSOCache };
+    transport.Enqueue(serverId, request); // not yet authenticated
+    networking.Update(&gc);
+    if (!drain(0)) return false;
+    GCMessageWrite connect{ k_EMsgNetworkConnect };
+    connect.WriteUint32(sizeof(ticket)); connect.WriteData(ticket, sizeof(ticket));
+    transport.Enqueue(serverId, connect);
+    networking.Update(&gc);
+    if (!drain(1)) return false;
+    transport.Enqueue(serverId + 1, request);
+    networking.Update(&gc);
+    if (!drain(0)) return false;
+    GCMessageWrite extra{ k_EMsgNetworkRequestSOCache }; extra.WriteUint32(123);
+    transport.Enqueue(serverId, extra);
+    networking.Update(&gc);
+    if (!drain(0)) return false;
+    transport.Enqueue(serverId, request);
+    networking.Update(&gc);
+    if (!drain(1)) return false;
+    for (int i = 0; i < 10; ++i) transport.Enqueue(serverId, request);
+    networking.Update(&gc);
+    if (!drain(0)) return false; // rate bound, not a full-cache flood
+    networking.ClearAuthTicket(1);
+    transport.Enqueue(serverId, request);
+    networking.Update(&gc);
+    return drain(0);
+}
+
+static bool WaitForHostMessage(ClientGC &gc, uint32_t type, EventData &result,
+    uint64_t *microTransactionId = nullptr)
+{
+    std::vector<EventData> events;
+    bool foundMessage = false;
+    bool foundMicroTransaction = microTransactionId == nullptr;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{ 1 };
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        gc.GetHostEvents(events);
+        for (EventData &event : events)
+        {
+            if (!foundMessage
+                && event.type == static_cast<int>(HostEvent::Message)
+                && (event.id & ~ProtobufMask) == type)
+            {
+                result = std::move(event);
+                foundMessage = true;
+            }
+            else if (microTransactionId
+                && event.type == static_cast<int>(HostEvent::MicroTransactionResponse))
+            {
+                *microTransactionId = event.id;
+                foundMicroTransaction = true;
+            }
+        }
+
+        if (foundMessage && foundMicroTransaction)
+        {
+            return true;
+        }
+
+        events.clear();
+        std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
+    }
+
+    return false;
+}
+
+static bool WaitForHostMessagesUntil(ClientGC &gc, uint32_t terminalType,
+    std::vector<EventData> &result, bool includeNonMessages = false)
+{
+    std::vector<EventData> events;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{ 1 };
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        gc.GetHostEvents(events);
+        bool foundTerminal = false;
+        for (EventData &event : events)
+        {
+            if (event.type != static_cast<int>(HostEvent::Message))
+            {
+                if (includeNonMessages) result.emplace_back(std::move(event));
+                continue;
+            }
+
+            const uint32_t type = static_cast<uint32_t>(event.id) & ~ProtobufMask;
+            foundTerminal |= type == terminalType;
+            result.emplace_back(std::move(event));
+        }
+
+        if (foundTerminal)
+        {
+            return true;
+        }
+
+        events.clear();
+        std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
+    }
+
+    return false;
+}
+
+static bool HostMessageNotReceived(ClientGC &gc, uint32_t type,
+    std::chrono::milliseconds duration = std::chrono::milliseconds{ 100 })
+{
+    std::vector<EventData> events;
+    auto deadline = std::chrono::steady_clock::now() + duration;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        gc.GetHostEvents(events);
+        for (const EventData &event : events)
+        {
+            if (event.type == static_cast<int>(HostEvent::Message)
+                && (event.id & ~ProtobufMask) == type)
+            {
+                return false;
+            }
+        }
+
+        events.clear();
+        std::this_thread::sleep_for(std::chrono::milliseconds{ 1 });
+    }
+
+    return true;
+}
+
+template<typename T>
+static bool ParseHostProtobuf(const EventData &event, T &message)
+{
+    GCMessageRead messageRead{ 0, event.buffer.data(), static_cast<uint32_t>(event.buffer.size()) };
+    return messageRead.IsValid() && messageRead.IsProtobuf() && messageRead.ReadProtobuf(message);
+}
+
+template<typename T>
+static bool ParseHostJobProtobuf(const EventData &event, uint64_t jobId, T &message)
+{
+    constexpr size_t HeaderPrefixSize = sizeof(uint32_t) + sizeof(uint32_t);
+    if (event.buffer.size() < HeaderPrefixSize)
+    {
+        return false;
+    }
+
+    const uint8_t *data = event.buffer.data();
+    uint32_t type = 0;
+    uint32_t headerSize = 0;
+    std::memcpy(&type, data, sizeof(type));
+    std::memcpy(&headerSize, data + sizeof(type), sizeof(headerSize));
+    if (!(type & ProtobufMask)
+        || !headerSize
+        || HeaderPrefixSize + headerSize > event.buffer.size())
+    {
+        return false;
+    }
+
+    CMsgProtoBufHeader header;
+    if (!header.ParseFromArray(data + HeaderPrefixSize, headerSize)
+        || header.job_id_target() != jobId)
+    {
+        return false;
+    }
+
+    const size_t bodyOffset = HeaderPrefixSize + headerSize;
+    return message.ParseFromArray(data + bodyOffset, event.buffer.size() - bodyOffset);
+}
+
+template<typename T>
+static void SendGCProtobuf(ClientGC &gc, uint32_t type, const T &message)
+{
+    GCMessageWrite messageWrite{ type, message };
+    gc.PostToGC(GCEvent::Message, messageWrite.TypeMasked(), messageWrite.Data(), messageWrite.Size());
+}
+
+static bool SendGCProtobufJobData(ClientGC &gc, uint32_t type,
+    const void *data, uint32_t size, uint64_t jobId)
+{
+    CMsgProtoBufHeader header;
+    header.set_job_id_source(jobId);
+
+    std::string headerData;
+    if (!header.SerializeToString(&headerData))
+    {
+        return false;
+    }
+
+    uint32_t maskedType = type | ProtobufMask;
+    GCMessageWrite messageWrite{ &maskedType, sizeof(maskedType) };
+    messageWrite.WriteUint32(static_cast<uint32_t>(headerData.size()));
+    messageWrite.WriteData(headerData.data(), static_cast<uint32_t>(headerData.size()));
+    messageWrite.WriteData(data, size);
+    gc.PostToGC(GCEvent::Message, messageWrite.TypeMasked(), messageWrite.Data(), messageWrite.Size());
+    return true;
+}
+
+template<typename T>
+static bool SendGCProtobufJob(ClientGC &gc, uint32_t type,
+    const T &message, uint64_t jobId)
+{
+    std::string messageData;
+    return message.SerializeToString(&messageData)
+        && SendGCProtobufJobData(gc, type, messageData.data(),
+            static_cast<uint32_t>(messageData.size()), jobId);
+}
+
+static bool IsMinimalPlayerProfile(
+    const CMsgGCCStrike15_v2_MatchmakingGC2ClientHello &profile,
+    uint32_t accountId)
+{
+    return profile.has_account_id()
+        && profile.account_id() == accountId
+        && !profile.has_ongoingmatch()
+        && !profile.has_global_stats()
+        && !profile.has_penalty_seconds()
+        && !profile.has_penalty_reason()
+        && !profile.has_vac_banned()
+        && !profile.has_ranking()
+        && !profile.has_commendation()
+        && !profile.has_medals()
+        && !profile.has_player_level()
+        && !profile.has_player_cur_xp()
+        && profile.rankings_size() == 0;
+}
+
+static bool PlayerProfileRequestsReturnMinimalProfiles()
+{
+    ClientGC gc{ 76561197960265729ull };
+
+    CMsgGCCStrike15_v2_ClientRequestPlayersProfile request;
+    request.set_account_id(123456);
+    request.set_request_level(0x20);
+    SendGCProtobuf(gc, k_EMsgGCCStrike15_v2_ClientRequestPlayersProfile, request);
+
+    EventData event;
+    CMsgGCCStrike15_v2_PlayersProfile response;
+    bool valid = WaitForHostMessage(gc, k_EMsgGCCStrike15_v2_PlayersProfile, event)
+        && ParseHostProtobuf(event, response)
+        && !response.has_request_id()
+        && response.account_profiles_size() == 1
+        && IsMinimalPlayerProfile(response.account_profiles(0), 123456);
+
+    request.Clear();
+    request.set_request_id__deprecated(42);
+    request.add_account_ids__deprecated(111);
+    request.add_account_ids__deprecated(222);
+    SendGCProtobuf(gc, k_EMsgGCCStrike15_v2_ClientRequestPlayersProfile, request);
+
+    event = {};
+    response.Clear();
+    valid &= WaitForHostMessage(gc, k_EMsgGCCStrike15_v2_PlayersProfile, event)
+        && ParseHostProtobuf(event, response)
+        && response.has_request_id()
+        && response.request_id() == 42
+        && response.account_profiles_size() == 2
+        && IsMinimalPlayerProfile(response.account_profiles(0), 111)
+        && IsMinimalPlayerProfile(response.account_profiles(1), 222);
+
+    return valid;
+}
+
+static bool InventoryPersistenceProtectsFiles()
+{
+    constexpr const char *InventoryDirectory = "csgo_gc";
+    constexpr const char *InventoryPath = "csgo_gc/inventory.txt";
+    constexpr std::string_view MalformedInventory{ "\"items\"\n{\n\"2\"\n{\n" };
+
+    if (!TestFilesystem::MakeDirectory(InventoryDirectory))
+    {
+        return false;
+    }
+
+    FILE *f = fopen(InventoryPath, "wb");
+    if (!f)
+    {
+        return false;
+    }
+
+    bool wroteFile = fwrite(MalformedInventory.data(), 1, MalformedInventory.size(), f)
+        == MalformedInventory.size();
+    wroteFile &= fclose(f) == 0;
+    if (!wroteFile)
+    {
+        return false;
+    }
+
+    {
+        Inventory inventory{ 76561197960265729ull };
+    }
+
+    bool preserved = LoadFile(InventoryPath) == MalformedInventory;
+    TestFilesystem::RemoveFile(InventoryPath);
+
+    {
+        Inventory inventory{ 76561197960265729ull };
+    }
+
+    KeyValue savedInventory{ "inventory" };
+    bool validEmptyInventory = savedInventory.ParseFromFile(InventoryPath)
+        && savedInventory.GetNumber<int>("format_version") == 1;
+
+    TestFilesystem::RemoveFile(InventoryPath);
+    TestFilesystem::RemoveDirectory(InventoryDirectory);
+    return preserved && validEmptyInventory;
+}
+
+static bool StatsSubscriptionDuplicatesKeepNewest()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    constexpr uint32_t AccountId = SteamId & UINT32_MAX;
+    constexpr uint64_t OldSubscriptionId = (uint64_t{ 3 } << 32) | AccountId;
+    constexpr uint64_t NewSubscriptionId = (uint64_t{ 9 } << 32) | AccountId;
+    constexpr uint64_t OtherItemId = (uint64_t{ 6 } << 32) | AccountId;
+    constexpr const char *InventoryPath = "csgo_gc/inventory.txt";
+
+    TestFilesystem::RemoveFile(InventoryPath);
+    if (!TestFilesystem::MakeDirectory("csgo_gc"))
+    {
+        return false;
+    }
+
+    KeyValue inventoryKey{ "inventory" };
+    inventoryKey.AddNumber("format_version", 1);
+    KeyValue &items = inventoryKey.AddSubkey("items");
+    auto addItem = [&](uint32_t highItemId, uint32_t defIndex, uint32_t position) {
+        KeyValue &item = items.AddSubkey(std::to_string(highItemId));
+        item.AddNumber("def_index", defIndex);
+        item.AddNumber("inventory", position);
+    };
+    addItem(3, ItemSchema::ItemStatsSubscription, 30);
+    addItem(6, 7, 60);
+    addItem(9, ItemSchema::ItemStatsSubscription, 90);
+    if (!inventoryKey.WriteToFile(InventoryPath))
+    {
+        TestFilesystem::RemoveFile(InventoryPath);
+        TestFilesystem::RemoveDirectory("csgo_gc");
+        return false;
+    }
+
+    bool valid = true;
+    {
+        Inventory inventory{ SteamId };
+        const CSOEconItem *newSubscription = inventory.GetItem(NewSubscriptionId);
+        valid &= inventory.ItemCount() == 2
+            && !inventory.GetItem(OldSubscriptionId)
+            && newSubscription
+            && newSubscription->def_index() == ItemSchema::ItemStatsSubscription
+            && newSubscription->inventory() == 90
+            && inventory.GetItem(OtherItemId);
+    }
+
+    KeyValue persisted{ "inventory" };
+    const KeyValue *persistedItems = nullptr;
+    valid &= persisted.ParseFromFile(InventoryPath);
+    if (valid)
+    {
+        persistedItems = persisted.GetSubkey("items");
+        valid &= persistedItems
+            && persistedItems->SubkeyCount() == 2
+            && !persistedItems->GetSubkey("3")
+            && persistedItems->GetSubkey("6")
+            && persistedItems->GetSubkey("9")
+            && persistedItems->GetSubkey("9")->GetNumber<uint32_t>("inventory") == 90;
+    }
+
+    TestFilesystem::RemoveFile(InventoryPath);
+    TestFilesystem::RemoveDirectory("csgo_gc");
+    return valid;
+}
+
+static int EquippedSlotForClass(const CSOEconItem &item, uint32_t classId)
+{
+    int slot = -1;
+    for (const CSOEconItemEquipped &equipped : item.equipped_state())
+    {
+        if (equipped.new_class() == classId)
+        {
+            if (slot != -1)
+            {
+                return -2;
+            }
+            slot = static_cast<int>(equipped.new_slot());
+        }
+    }
+    return slot;
+}
+
+static uint64_t DefaultEquipKey(uint32_t classId, uint32_t slotId)
+{
+    return (static_cast<uint64_t>(classId) << 32) | slotId;
+}
+
+static bool ApplyDefaultEquipUpdates(const CMsgSOMultipleObjects &update,
+    std::unordered_map<uint64_t, uint32_t> &defaultEquips)
+{
+    for (const CMsgSOMultipleObjects_SingleObject &object : update.objects_modified())
+    {
+        if (object.type_id() != SOTypeDefaultEquippedDefinitionInstanceClient)
+        {
+            continue;
+        }
+
+        CSOEconDefaultEquippedDefinitionInstanceClient defaultEquip;
+        if (!defaultEquip.ParseFromString(object.object_data())
+            || !defaultEquip.has_class_id() || !defaultEquip.has_slot_id())
+        {
+            return false;
+        }
+
+        uint64_t key = DefaultEquipKey(defaultEquip.class_id(), defaultEquip.slot_id());
+        if (defaultEquip.item_definition())
+        {
+            defaultEquips[key] = defaultEquip.item_definition();
+        }
+        else
+        {
+            defaultEquips.erase(key);
+        }
+    }
+
+    return true;
+}
+
+static bool DefaultEquipMatches(const std::unordered_map<uint64_t, uint32_t> &defaultEquips,
+    uint32_t defIndex, uint32_t classId, uint32_t slotId)
+{
+    auto it = defaultEquips.find(DefaultEquipKey(classId, slotId));
+    return it != defaultEquips.end() && it->second == defIndex;
+}
+
+static std::unordered_map<uint64_t, uint32_t> SnapshotDefaultEquips(Inventory &inventory)
+{
+    CMsgSOCacheSubscribed subscription;
+    inventory.BuildCacheSubscription(subscription, false);
+
+    std::unordered_map<uint64_t, uint32_t> defaultEquips;
+    for (const CMsgSOCacheSubscribed_SubscribedType &type : subscription.objects())
+    {
+        if (type.type_id() != SOTypeDefaultEquippedDefinitionInstanceClient)
+        {
+            continue;
+        }
+
+        for (const std::string &data : type.object_data())
+        {
+            CSOEconDefaultEquippedDefinitionInstanceClient defaultEquip;
+            if (defaultEquip.ParseFromString(data) && defaultEquip.item_definition())
+            {
+                defaultEquips[DefaultEquipKey(defaultEquip.class_id(), defaultEquip.slot_id())]
+                    = defaultEquip.item_definition();
+            }
+        }
+    }
+
+    return defaultEquips;
+}
+
+static bool WriteLoadoutFixture()
+{
+    if (!TestFilesystem::MakeDirectory("csgo_gc"))
+    {
+        return false;
+    }
+
+    KeyValue inventory{ "inventory" };
+    inventory.AddNumber("format_version", 1);
+    KeyValue &items = inventory.AddSubkey("items");
+
+    auto addItem = [&](const char *highItemId, uint32_t defIndex, uint32_t class2Slot,
+                       bool equipForClass3)
+    {
+        KeyValue &item = items.AddSubkey(highItemId);
+        item.AddNumber("def_index", defIndex);
+        KeyValue &equippedState = item.AddSubkey("equipped_state");
+        equippedState.AddNumber("2", class2Slot);
+        if (equipForClass3)
+        {
+            equippedState.AddNumber("3", class2Slot);
+        }
+    };
+
+    addItem("1", 7, 1, true);
+    addItem("2", 8, 2, false);
+    addItem("3", 10, 3, false);
+
+    KeyValue &defaultEquips = inventory.AddSubkey("default_equips");
+    KeyValue &defaultEquip = defaultEquips.AddSubkey("9");
+    defaultEquip.AddNumber("class_id", 2);
+    defaultEquip.AddNumber("slot_id", 4);
+    KeyValue &otherDefaultEquip = defaultEquips.AddSubkey("11");
+    otherDefaultEquip.AddNumber("class_id", 2);
+    otherDefaultEquip.AddNumber("slot_id", 6);
+    return inventory.WriteToFile("csgo_gc/inventory.txt");
+}
+
+static bool LoadoutStateTransitionsPreserveClassesAndSwapSlots()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    constexpr uint64_t Item1 = (uint64_t{ 1 } << 32) | (SteamId & UINT32_MAX);
+    constexpr uint64_t Item2 = (uint64_t{ 2 } << 32) | (SteamId & UINT32_MAX);
+    constexpr uint64_t Item3 = (uint64_t{ 3 } << 32) | (SteamId & UINT32_MAX);
+    constexpr uint64_t DefaultItem = ItemIdDefaultItemMask | 9;
+
+    TestFilesystem::RemoveFile("csgo_gc/inventory.txt");
+    if (!WriteLoadoutFixture())
+    {
+        return false;
+    }
+
+    bool valid = true;
+    {
+        Inventory inventory{ SteamId };
+        uint64_t version = inventory.Version();
+        valid &= version != 0;
+        std::unordered_map<uint64_t, uint32_t> clientDefaultEquips{
+            { DefaultEquipKey(2, 4), 9 },
+            { DefaultEquipKey(2, 6), 11 },
+        };
+
+        CMsgSOMultipleObjects unequip;
+        valid &= inventory.EquipItem(Item1, 2, 0xffff, false, unequip);
+        valid &= unequip.version() == version + 1 && inventory.Version() == unequip.version();
+        version = inventory.Version();
+        const CSOEconItem *item1 = inventory.GetItem(Item1);
+        valid &= item1 && EquippedSlotForClass(*item1, 2) == -1
+            && EquippedSlotForClass(*item1, 3) == 1;
+
+        CMsgSOMultipleObjects unchangedUnequip;
+        valid &= !inventory.EquipItem(Item1, 2, 0xffff, false, unchangedUnequip)
+            && !unchangedUnequip.has_version()
+            && unchangedUnequip.objects_modified_size() == 0;
+
+        CMsgSOMultipleObjects move;
+        valid &= inventory.EquipItem(Item2, 2, 5, false, move);
+        valid &= move.version() == version + 1 && inventory.Version() == move.version();
+        version = inventory.Version();
+        const CSOEconItem *item2 = inventory.GetItem(Item2);
+        valid &= item2 && EquippedSlotForClass(*item2, 2) == 5;
+
+        CMsgSOMultipleObjects uniqueSwap;
+        valid &= inventory.EquipItem(Item2, 2, 3, true, uniqueSwap);
+        valid &= uniqueSwap.version() == version + 1
+            && inventory.Version() == uniqueSwap.version()
+            && uniqueSwap.objects_modified_size() >= 2;
+        version = inventory.Version();
+        item2 = inventory.GetItem(Item2);
+        const CSOEconItem *item3 = inventory.GetItem(Item3);
+        valid &= item2 && item3
+            && EquippedSlotForClass(*item2, 2) == 3
+            && EquippedSlotForClass(*item3, 2) == -1;
+
+        CMsgSOMultipleObjects defaultSwap;
+        valid &= inventory.EquipItem(DefaultItem, 2, 3, true, defaultSwap);
+        valid &= defaultSwap.version() == version + 1
+            && inventory.Version() == defaultSwap.version()
+            && ApplyDefaultEquipUpdates(defaultSwap, clientDefaultEquips)
+            && DefaultEquipMatches(clientDefaultEquips, 9, 2, 3)
+            && DefaultEquipMatches(clientDefaultEquips, 11, 2, 6)
+            && !clientDefaultEquips.contains(DefaultEquipKey(2, 4));
+        version = inventory.Version();
+        item1 = inventory.GetItem(Item1);
+        item2 = inventory.GetItem(Item2);
+        valid &= item1 && item2
+            && EquippedSlotForClass(*item1, 3) == 1
+            && EquippedSlotForClass(*item2, 2) == 4;
+
+        CMsgSOMultipleObjects defaultToDefaultSwap;
+        valid &= inventory.EquipItem(DefaultItem, 2, 6, true, defaultToDefaultSwap);
+        valid &= defaultToDefaultSwap.version() == version + 1
+            && inventory.Version() == defaultToDefaultSwap.version()
+            && ApplyDefaultEquipUpdates(defaultToDefaultSwap, clientDefaultEquips)
+            && DefaultEquipMatches(clientDefaultEquips, 11, 2, 3)
+            && DefaultEquipMatches(clientDefaultEquips, 9, 2, 6)
+            && clientDefaultEquips == SnapshotDefaultEquips(inventory);
+    }
+
+    TestFilesystem::RemoveFile("csgo_gc/inventory.txt");
+    TestFilesystem::RemoveDirectory("csgo_gc");
+    return valid;
+}
+
+static bool SOCacheVersionNegotiationAndRefresh()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    TestFilesystem::RemoveFile("csgo_gc/inventory.txt");
+    if (!TestFilesystem::MakeDirectory("csgo_gc"))
+    {
+        return false;
+    }
+
+    bool valid = true;
+    {
+        ClientGC gc{ SteamId };
+
+        CMsgClientHello hello;
+        hello.set_version(1);
+        GCMessageWrite helloMessage{ k_EMsgGCClientHello, hello };
+        gc.PostToGC(GCEvent::Message, helloMessage.TypeMasked(), helloMessage.Data(), helloMessage.Size());
+
+        EventData event;
+        CMsgClientWelcome welcome;
+        valid &= WaitForHostMessage(gc, k_EMsgGCClientWelcome, event)
+            && ParseHostProtobuf(event, welcome)
+            && welcome.outofdate_subscribed_caches_size() == 1
+            && welcome.uptodate_subscribed_caches_size() == 0;
+
+        uint64_t version = 0;
+        if (welcome.outofdate_subscribed_caches_size() == 1)
+        {
+            const CMsgSOCacheSubscribed &subscription = welcome.outofdate_subscribed_caches(0);
+            version = subscription.version();
+            valid &= version != 0
+                && subscription.has_owner_soid()
+                && subscription.owner_soid().type() == SoIdTypeSteamId
+                && subscription.owner_soid().id() == SteamId;
+
+            bool foundAccount = false;
+            for (const CMsgSOCacheSubscribed_SubscribedType &type : subscription.objects())
+            {
+                if (type.type_id() == SOTypeGameAccountClient && type.object_data_size() == 1)
+                {
+                    CSOEconGameAccountClient account;
+                    foundAccount = account.ParseFromString(type.object_data(0));
+                    valid &= foundAccount && !account.has_elevated_timestamp();
+                }
+            }
+            valid &= foundAccount;
+        }
+
+        CMsgClientHello currentHello;
+        CMsgSOCacheHaveVersion *haveVersion = currentHello.add_socache_have_versions();
+        haveVersion->mutable_soid()->set_type(SoIdTypeSteamId);
+        haveVersion->mutable_soid()->set_id(SteamId);
+        haveVersion->set_version(version);
+        GCMessageWrite currentHelloMessage{ k_EMsgGCClientHello, currentHello };
+        gc.PostToGC(GCEvent::Message, currentHelloMessage.TypeMasked(), currentHelloMessage.Data(),
+            currentHelloMessage.Size());
+
+        event = {};
+        welcome.Clear();
+        valid &= WaitForHostMessage(gc, k_EMsgGCClientWelcome, event)
+            && ParseHostProtobuf(event, welcome)
+            && welcome.outofdate_subscribed_caches_size() == 0
+            && welcome.uptodate_subscribed_caches_size() == 1;
+        if (welcome.uptodate_subscribed_caches_size() == 1)
+        {
+            const CMsgSOCacheSubscriptionCheck &check = welcome.uptodate_subscribed_caches(0);
+            valid &= check.version() == version
+                && check.has_owner_soid()
+                && check.owner_soid().type() == SoIdTypeSteamId
+                && check.owner_soid().id() == SteamId;
+        }
+
+        CMsgSOCacheSubscriptionRefresh refresh;
+        refresh.mutable_owner_soid()->set_type(SoIdTypeSteamId);
+        refresh.mutable_owner_soid()->set_id(SteamId);
+        GCMessageWrite refreshMessage{ k_ESOMsg_CacheSubscriptionRefresh, refresh };
+        gc.PostToGC(GCEvent::Message, refreshMessage.TypeMasked(), refreshMessage.Data(),
+            refreshMessage.Size());
+
+        event = {};
+        CMsgSOCacheSubscribed refreshed;
+        valid &= WaitForHostMessage(gc, k_ESOMsg_CacheSubscribed, event)
+            && ParseHostProtobuf(event, refreshed)
+            && refreshed.version() == version
+            && refreshed.owner_soid().id() == SteamId;
+    }
+
+    TestFilesystem::RemoveFile("csgo_gc/inventory.txt");
+    TestFilesystem::RemoveDirectory("csgo_gc");
+    return valid;
+}
+
+static void RemoveCustomizationFixtures()
+{
+    TestFilesystem::RemoveFile("csgo_gc/inventory.txt");
+    TestFilesystem::RemoveFile("csgo_gc/unusual_loot_lists.txt");
+    TestFilesystem::RemoveFile("csgo_gc/gc_loot_lists.txt");
+    TestFilesystem::RemoveFile("csgo/scripts/items/items_game.txt");
+    TestFilesystem::RemoveDirectory("csgo/scripts/items");
+    TestFilesystem::RemoveDirectory("csgo/scripts");
+    TestFilesystem::RemoveDirectory("csgo");
+    TestFilesystem::RemoveDirectory("csgo_gc");
+}
+
+static bool WriteCustomizationFixtures()
+{
+    if (!TestFilesystem::MakeDirectory("csgo")
+        || !TestFilesystem::MakeDirectory("csgo/scripts")
+        || !TestFilesystem::MakeDirectory("csgo/scripts/items")
+        || !TestFilesystem::MakeDirectory("csgo_gc"))
+    {
+        return false;
+    }
+
+    KeyValue schema{ "root" };
+    KeyValue &itemsGame = schema.AddSubkey("items_game");
+
+    KeyValue &attributes = itemsGame.AddSubkey("attributes");
+    attributes.AddSubkey(std::to_string(ItemSchema::AttributeStickerId0))
+        .AddNumber("stored_as_integer", 1);
+    attributes.AddSubkey(std::to_string(ItemSchema::AttributeStickerWear0))
+        .AddString("attribute_type", "float");
+    attributes.AddSubkey(std::to_string(ItemSchema::AttributeStickerScale0))
+        .AddString("attribute_type", "float");
+    attributes.AddSubkey(std::to_string(ItemSchema::AttributeStickerRotation0))
+        .AddString("attribute_type", "float");
+
+    KeyValue &items = itemsGame.AddSubkey("items");
+    KeyValue &weapon = items.AddSubkey("7");
+    weapon.AddString("name", "weapon_ak47");
+    weapon.AddString("item_rarity", "uncommon");
+    KeyValue &weaponCapabilities = weapon.AddSubkey("capabilities");
+    weaponCapabilities.AddNumber("can_sticker", 1);
+    weaponCapabilities.AddNumber("nameable", 1);
+
+    items.AddSubkey(std::to_string(ItemSchema::ItemSticker)).AddString("name", "sticker");
+    items.AddSubkey("999").AddString("name", "name_tag");
+
+    KeyValue inventory{ "inventory" };
+    inventory.AddNumber("format_version", 1);
+    KeyValue &inventoryItems = inventory.AddSubkey("items");
+
+    auto addSticker = [&](const char *highItemId, uint32_t stickerKit)
+    {
+        KeyValue &item = inventoryItems.AddSubkey(highItemId);
+        item.AddNumber("def_index", ItemSchema::ItemSticker);
+        item.AddNumber("origin", ItemOriginTraded);
+        item.AddNumber("rarity", ItemSchema::RarityCommon);
+        item.AddSubkey("attributes")
+            .AddNumber(std::to_string(ItemSchema::AttributeStickerId0), stickerKit);
+    };
+    auto addNameTag = [&](const char *highItemId)
+    {
+        KeyValue &item = inventoryItems.AddSubkey(highItemId);
+        item.AddNumber("def_index", 999);
+        item.AddNumber("origin", ItemOriginTraded);
+        item.AddNumber("rarity", ItemSchema::RarityCommon);
+    };
+
+    addSticker("1", 101);
+    addSticker("2", 102);
+    addNameTag("3");
+    addNameTag("4");
+
+    KeyValue unusualLootLists{ "unusual_loot_lists" };
+    KeyValue gcLootLists{ "gc_loot_lists" };
+    return schema.WriteToFile("csgo/scripts/items/items_game.txt")
+        && inventory.WriteToFile("csgo_gc/inventory.txt")
+        && unusualLootLists.WriteToFile("csgo_gc/unusual_loot_lists.txt")
+        && gcLootLists.WriteToFile("csgo_gc/gc_loot_lists.txt");
+}
+
+static bool ParseItemObject(const CMsgSOSingleObject &object, CSOEconItem &item)
+{
+    return object.type_id() == SOTypeItem && item.ParseFromString(object.object_data());
+}
+
+static bool HasAttribute(const CSOEconItem &item, uint32_t defIndex)
+{
+    for (const CSOEconItemAttribute &attribute : item.attribute())
+    {
+        if (attribute.def_index() == defIndex)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool GetUint32Attribute(const CSOEconItem &item, uint32_t defIndex, uint32_t &value)
+{
+    for (const CSOEconItemAttribute &attribute : item.attribute())
+    {
+        if (attribute.def_index() == defIndex && attribute.value_bytes().size() == sizeof(value))
+        {
+            std::memcpy(&value, attribute.value_bytes().data(), sizeof(value));
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ScrapeStickerUntilRemoved(Inventory &inventory, uint64_t itemId,
+    bool expectDestroyed, std::string_view expectedName)
+{
+    CMsgApplySticker scrape;
+    scrape.set_item_item_id(itemId);
+    scrape.set_sticker_slot(0);
+
+    for (int i = 0; i < 12; i++)
+    {
+        CMsgSOSingleObject update;
+        CMsgSOSingleObject destroy;
+        CMsgGCItemCustomizationNotification notification;
+        if (!inventory.ScrapeSticker(scrape, update, destroy, notification))
+        {
+            return false;
+        }
+
+        const CSOEconItem *item = inventory.GetItem(itemId);
+        if (!item)
+        {
+            CSOEconItem destroyedItem;
+            return expectDestroyed
+                && !update.has_object_data()
+                && ParseItemObject(destroy, destroyedItem)
+                && destroyedItem.id() == itemId
+                && notification.request() == k_EGCItemCustomizationNotification_RemoveSticker
+                && notification.item_id_size() == 1
+                && notification.item_id(0) == (ItemIdDefaultItemMask | 7);
+        }
+
+        if (!HasAttribute(*item, ItemSchema::AttributeStickerId0))
+        {
+            CSOEconItem updatedItem;
+            return !expectDestroyed
+                && ParseItemObject(update, updatedItem)
+                && !destroy.has_object_data()
+                && updatedItem.id() == itemId
+                && updatedItem.custom_name() == expectedName
+                && updatedItem.attribute_size() == 0
+                && notification.request() == k_EGCItemCustomizationNotification_RemoveSticker
+                && notification.item_id_size() == 1
+                && notification.item_id(0) == itemId;
+        }
+    }
+
+    return false;
+}
+
+static bool BaseItemCustomizationsPreserveRemainingState()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    auto itemId = [&](uint32_t highItemId)
+    {
+        return (static_cast<uint64_t>(highItemId) << 32) | (SteamId & UINT32_MAX);
+    };
+
+    RemoveCustomizationFixtures();
+    if (!WriteCustomizationFixtures())
+    {
+        RemoveCustomizationFixtures();
+        return false;
+    }
+
+    bool valid = true;
+    {
+        Inventory inventory{ SteamId };
+
+        CMsgApplySticker applyToBase;
+        applyToBase.set_sticker_item_id(itemId(1));
+        applyToBase.set_sticker_slot(0);
+        applyToBase.set_baseitem_defidx(7);
+        CMsgSOSingleObject stickerCreate;
+        CMsgSOSingleObject stickerDestroy;
+        CMsgGCItemCustomizationNotification stickerNotification;
+        valid &= inventory.ApplySticker(applyToBase, stickerCreate, stickerDestroy,
+            stickerNotification);
+
+        CSOEconItem stickerClone;
+        valid &= ParseItemObject(stickerCreate, stickerClone)
+            && stickerClone.origin() == ItemOriginBaseItem
+            && stickerClone.rarity() == ItemSchema::RarityDefault;
+
+        CMsgSOSingleObject nameUpdate;
+        CMsgSOSingleObject nameTagDestroy;
+        CMsgGCItemCustomizationNotification nameNotification;
+        valid &= inventory.NameItem(itemId(3), stickerClone.id(), "named",
+            nameUpdate, nameTagDestroy, nameNotification);
+        valid &= ScrapeStickerUntilRemoved(inventory, stickerClone.id(), false, "named");
+
+        CMsgSOSingleObject removeNameUpdate;
+        CMsgSOSingleObject removeNameDestroy;
+        CMsgGCItemCustomizationNotification removeNameNotification;
+        valid &= inventory.RemoveItemName(stickerClone.id(), removeNameUpdate,
+            removeNameDestroy, removeNameNotification);
+        CSOEconItem destroyedStickerClone;
+        valid &= !inventory.GetItem(stickerClone.id())
+            && !removeNameUpdate.has_object_data()
+            && ParseItemObject(removeNameDestroy, destroyedStickerClone)
+            && destroyedStickerClone.id() == stickerClone.id();
+
+        CMsgSOSingleObject nameCreate;
+        CMsgSOSingleObject secondNameTagDestroy;
+        CMsgGCItemCustomizationNotification secondNameNotification;
+        valid &= inventory.NameBaseItem(itemId(4), 7, "named", nameCreate,
+            secondNameTagDestroy, secondNameNotification);
+
+        CSOEconItem nameClone;
+        valid &= ParseItemObject(nameCreate, nameClone)
+            && nameClone.origin() == ItemOriginBaseItem
+            && nameClone.rarity() == ItemSchema::RarityDefault;
+
+        CMsgApplySticker applyToNamedClone;
+        applyToNamedClone.set_sticker_item_id(itemId(2));
+        applyToNamedClone.set_sticker_slot(0);
+        applyToNamedClone.set_item_item_id(nameClone.id());
+        CMsgSOSingleObject secondStickerUpdate;
+        CMsgSOSingleObject secondStickerDestroy;
+        CMsgGCItemCustomizationNotification secondStickerNotification;
+        valid &= inventory.ApplySticker(applyToNamedClone, secondStickerUpdate,
+            secondStickerDestroy, secondStickerNotification);
+
+        CMsgSOSingleObject secondRemoveNameUpdate;
+        CMsgSOSingleObject secondRemoveNameDestroy;
+        CMsgGCItemCustomizationNotification secondRemoveNameNotification;
+        valid &= inventory.RemoveItemName(nameClone.id(), secondRemoveNameUpdate,
+            secondRemoveNameDestroy, secondRemoveNameNotification);
+        const CSOEconItem *unnamedClone = inventory.GetItem(nameClone.id());
+        CSOEconItem updatedUnnamedClone;
+        valid &= unnamedClone
+            && unnamedClone->custom_name().empty()
+            && HasAttribute(*unnamedClone, ItemSchema::AttributeStickerId0)
+            && ParseItemObject(secondRemoveNameUpdate, updatedUnnamedClone)
+            && !secondRemoveNameDestroy.has_object_data();
+
+        valid &= ScrapeStickerUntilRemoved(inventory, nameClone.id(), true, {});
+    }
+
+    RemoveCustomizationFixtures();
+    return valid;
+}
+
+static void RemoveStatTrakFixtures()
+{
+    TestFilesystem::RemoveFile("csgo_gc/inventory.txt");
+    TestFilesystem::RemoveFile("csgo_gc/unusual_loot_lists.txt");
+    TestFilesystem::RemoveFile("csgo_gc/gc_loot_lists.txt");
+    TestFilesystem::RemoveFile("csgo/scripts/items/items_game.txt");
+    TestFilesystem::RemoveDirectory("csgo/scripts/items");
+    TestFilesystem::RemoveDirectory("csgo/scripts");
+    TestFilesystem::RemoveDirectory("csgo");
+    TestFilesystem::RemoveDirectory("csgo_gc");
+}
+
+static bool WriteStatTrakFixtures()
+{
+    if (!TestFilesystem::MakeDirectory("csgo")
+        || !TestFilesystem::MakeDirectory("csgo/scripts")
+        || !TestFilesystem::MakeDirectory("csgo/scripts/items")
+        || !TestFilesystem::MakeDirectory("csgo_gc"))
+    {
+        return false;
+    }
+
+    KeyValue schema{ "root" };
+    KeyValue &itemsGame = schema.AddSubkey("items_game");
+    KeyValue &attributes = itemsGame.AddSubkey("attributes");
+    attributes.AddSubkey(std::to_string(ItemSchema::AttributeKillEater))
+        .AddNumber("stored_as_integer", 1);
+    attributes.AddSubkey(std::to_string(ItemSchema::AttributeKillEaterScoreType))
+        .AddNumber("stored_as_integer", 1);
+
+    KeyValue &items = itemsGame.AddSubkey("items");
+    items.AddSubkey(std::to_string(ItemSchema::ItemStatTrakSwapTool))
+        .AddString("name", "stattrak_swap_tool");
+    KeyValue &bundle = items.AddSubkey(std::to_string(ItemSchema::ItemStatTrakSwapToolBundle));
+    bundle.AddString("name", "crate_stattrak_swap_tool");
+    bundle.AddString("loot_list_name", "bundle_tool_stattrak_swap");
+
+    auto addKnifeDefinition = [&](uint32_t defIndex, const char *name)
+    {
+        KeyValue &knife = items.AddSubkey(std::to_string(defIndex));
+        knife.AddString("name", name);
+        knife.AddSubkey("capabilities").AddNumber("can_stattrack_swap", 1);
+    };
+    addKnifeDefinition(500, "weapon_knife");
+    addKnifeDefinition(507, "weapon_knife_karambit");
+
+    KeyValue inventory{ "inventory" };
+    inventory.AddNumber("format_version", 1);
+    KeyValue &inventoryItems = inventory.AddSubkey("items");
+
+    auto addItem = [&](const char *highItemId, uint32_t defIndex, uint32_t quality,
+        uint32_t rarity)
+    {
+        KeyValue &item = inventoryItems.AddSubkey(highItemId);
+        item.AddNumber("def_index", defIndex);
+        item.AddNumber("quality", quality);
+        item.AddNumber("origin", ItemOriginTraded);
+        item.AddNumber("rarity", rarity);
+        return &item;
+    };
+
+    addItem("1", ItemSchema::ItemStatTrakSwapToolBundle,
+        ItemSchema::QualityUnique, ItemSchema::RarityCommon);
+    addItem("2", ItemSchema::ItemStatTrakSwapTool,
+        ItemSchema::QualityUnique, ItemSchema::RarityCommon);
+
+    KeyValue *karambit = addItem("3", 507,
+        ItemSchema::QualityUnusual, ItemSchema::RarityAncient);
+    KeyValue &karambitAttributes = karambit->AddSubkey("attributes");
+    karambitAttributes.AddNumber(std::to_string(ItemSchema::AttributeKillEater), 7);
+    karambitAttributes.AddNumber(std::to_string(ItemSchema::AttributeKillEaterScoreType), 0);
+
+    KeyValue *bayonet = addItem("4", 500,
+        ItemSchema::QualityUnusual, ItemSchema::RarityAncient);
+    KeyValue &bayonetAttributes = bayonet->AddSubkey("attributes");
+    bayonetAttributes.AddNumber(std::to_string(ItemSchema::AttributeKillEater), 60);
+    bayonetAttributes.AddNumber(std::to_string(ItemSchema::AttributeKillEaterScoreType), 0);
+
+    KeyValue unusualLootLists{ "unusual_loot_lists" };
+    KeyValue gcLootLists{ "gc_loot_lists" };
+    return schema.WriteToFile("csgo/scripts/items/items_game.txt")
+        && inventory.WriteToFile("csgo_gc/inventory.txt")
+        && unusualLootLists.WriteToFile("csgo_gc/unusual_loot_lists.txt")
+        && gcLootLists.WriteToFile("csgo_gc/gc_loot_lists.txt");
+}
+
+static bool StatTrakSwapToolTwoPackCreatesTwoTools()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    auto itemId = [&](uint32_t highItemId)
+    {
+        return (static_cast<uint64_t>(highItemId) << 32) | (SteamId & UINT32_MAX);
+    };
+
+    RemoveStatTrakFixtures();
+    if (!WriteStatTrakFixtures())
+    {
+        RemoveStatTrakFixtures();
+        return false;
+    }
+
+    bool valid = true;
+    {
+        ClientGC gc{ SteamId };
+        GCMessageWrite request{ k_EMsgGCUnlockCrate };
+        request.WriteUint64(0);
+        request.WriteUint64(itemId(1));
+        gc.PostToGC(GCEvent::Message, request.TypeMasked(), request.Data(), request.Size());
+
+        std::vector<EventData> events;
+        valid &= WaitForHostMessagesUntil(gc, k_EMsgGCItemCustomizationNotification, events);
+
+        int createCount = 0;
+        int destroyCount = 0;
+        int notificationCount = 0;
+        std::unordered_set<uint64_t> createdIds;
+        std::unordered_set<uint64_t> notifiedIds;
+        for (const EventData &event : events)
+        {
+            const uint32_t type = static_cast<uint32_t>(event.id) & ~ProtobufMask;
+            if (type == k_ESOMsg_Create)
+            {
+                CMsgSOSingleObject object;
+                CSOEconItem item;
+                const bool parsed = ParseHostProtobuf(event, object) && ParseItemObject(object, item);
+                valid &= parsed;
+                if (parsed)
+                {
+                    valid &= item.def_index() == ItemSchema::ItemStatTrakSwapTool
+                        && item.origin() == ItemOriginCrate
+                        && createdIds.insert(item.id()).second;
+                }
+                ++createCount;
+            }
+            else if (type == k_ESOMsg_Destroy)
+            {
+                CMsgSOSingleObject object;
+                CSOEconItem item;
+                valid &= ParseHostProtobuf(event, object)
+                    && ParseItemObject(object, item)
+                    && item.id() == itemId(1);
+                ++destroyCount;
+            }
+            else if (type == k_EMsgGCItemCustomizationNotification)
+            {
+                CMsgGCItemCustomizationNotification notification;
+                const bool parsed = ParseHostProtobuf(event, notification);
+                valid &= parsed;
+                if (parsed)
+                {
+                    valid &= notification.request()
+                        == k_EGCItemCustomizationNotification_UnlockCrate;
+                    for (uint64_t id : notification.item_id())
+                    {
+                        notifiedIds.insert(id);
+                    }
+                }
+                ++notificationCount;
+            }
+        }
+
+        valid &= createCount == 2
+            && destroyCount == 1
+            && notificationCount == 1
+            && createdIds.size() == 2
+            && createdIds == notifiedIds;
+    }
+
+    RemoveStatTrakFixtures();
+    return valid;
+}
+
+static bool UnusualStatTrakKnivesCanSwapCounters()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    auto itemId = [&](uint32_t highItemId)
+    {
+        return (static_cast<uint64_t>(highItemId) << 32) | (SteamId & UINT32_MAX);
+    };
+
+    RemoveStatTrakFixtures();
+    if (!WriteStatTrakFixtures())
+    {
+        RemoveStatTrakFixtures();
+        return false;
+    }
+
+    bool valid = true;
+    {
+        ClientGC gc{ SteamId };
+        CMsgApplyStatTrakSwap request;
+        request.set_tool_item_id(itemId(2));
+        request.set_item_1_item_id(itemId(3));
+        request.set_item_2_item_id(itemId(4));
+        SendGCProtobuf(gc, k_EMsgGCStatTrakSwap, request);
+
+        std::vector<EventData> events;
+        valid &= WaitForHostMessagesUntil(gc, k_EMsgGCItemCustomizationNotification, events);
+
+        int updateCount = 0;
+        int destroyCount = 0;
+        int notificationCount = 0;
+        const std::unordered_set<uint64_t> expectedWeaponIds{ itemId(3), itemId(4) };
+        std::unordered_set<uint64_t> updatedIds;
+        std::unordered_set<uint64_t> notifiedIds;
+        for (const EventData &event : events)
+        {
+            const uint32_t type = static_cast<uint32_t>(event.id) & ~ProtobufMask;
+            if (type == k_ESOMsg_Update)
+            {
+                CMsgSOSingleObject object;
+                CSOEconItem item;
+                const bool parsed = ParseHostProtobuf(event, object) && ParseItemObject(object, item);
+                valid &= parsed;
+                if (parsed)
+                {
+                    uint32_t counter = 0;
+                    valid &= updatedIds.insert(item.id()).second
+                        && item.quality() == ItemSchema::QualityUnusual
+                        && GetUint32Attribute(item, ItemSchema::AttributeKillEater, counter);
+                    if (item.id() == itemId(3))
+                    {
+                        valid &= counter == 60;
+                    }
+                    else if (item.id() == itemId(4))
+                    {
+                        valid &= counter == 7;
+                    }
+                    else
+                    {
+                        valid = false;
+                    }
+                }
+                ++updateCount;
+            }
+            else if (type == k_ESOMsg_Destroy)
+            {
+                CMsgSOSingleObject object;
+                CSOEconItem item;
+                valid &= ParseHostProtobuf(event, object)
+                    && ParseItemObject(object, item)
+                    && item.id() == itemId(2);
+                ++destroyCount;
+            }
+            else if (type == k_EMsgGCItemCustomizationNotification)
+            {
+                CMsgGCItemCustomizationNotification notification;
+                const bool parsed = ParseHostProtobuf(event, notification);
+                valid &= parsed;
+                if (parsed)
+                {
+                    valid &= notification.request()
+                        == k_EGCItemCustomizationNotification_StatTrakSwap;
+                    for (uint64_t id : notification.item_id())
+                    {
+                        notifiedIds.insert(id);
+                    }
+                }
+                ++notificationCount;
+            }
+        }
+
+        valid &= updateCount == 2
+            && destroyCount == 1
+            && notificationCount == 1
+            && updatedIds == expectedWeaponIds
+            && notifiedIds == expectedWeaponIds;
+    }
+
+    RemoveStatTrakFixtures();
+    return valid;
+}
+
+static bool WriteStoreFixtures()
+{
+    if (!TestFilesystem::MakeDirectory("csgo")
+        || !TestFilesystem::MakeDirectory("csgo/scripts")
+        || !TestFilesystem::MakeDirectory("csgo/scripts/items")
+        || !TestFilesystem::MakeDirectory("csgo_gc"))
+    {
+        return false;
+    }
+
+    KeyValue schema{ "root" };
+    KeyValue &itemsGame = schema.AddSubkey("items_game");
+    KeyValue &items = itemsGame.AddSubkey("items");
+    items.AddSubkey("7").AddString("name", "weapon_ak47");
+    KeyValue &crate = items.AddSubkey("8");
+    crate.AddString("name", "crate_test");
+    crate.AddString("loot_list_name", "crate_test");
+    items.AddSubkey(std::to_string(ItemSchema::ItemStatsSubscription))
+        .AddString("name", "subscription1");
+
+    KeyValue unusualLootLists{ "unusual_loot_lists" };
+    unusualLootLists.AddSubkey("empty");
+
+    KeyValue priceSheet{ "price_sheet" };
+    KeyValue &store = priceSheet.AddSubkey("store");
+    store.AddNumber("featured_item_index", 7);
+    KeyValue &bannerLayout = store.AddSubkey("store_banner_layout");
+    bannerLayout.AddSubkey("8").AddNumber("market_link", 1);
+    KeyValue &entries = store.AddSubkey("entries");
+    KeyValue &priceTemplate = entries.AddSubkey("offline_price_template");
+    priceTemplate.AddString("item_link", "weapon_ak47");
+    KeyValue &prices = priceTemplate.AddSubkey("prices");
+    prices.AddNumber("USD", 99);
+    prices.AddNumber("CNY", 700);
+
+    return schema.WriteToFile("csgo/scripts/items/items_game.txt")
+        && unusualLootLists.WriteToFile("csgo_gc/unusual_loot_lists.txt")
+        && priceSheet.WriteToFile("csgo_gc/price_sheet.txt");
+}
+
+static void RemoveStoreFixtures()
+{
+    TestFilesystem::RemoveFile("csgo_gc/inventory.txt");
+    TestFilesystem::RemoveFile("csgo_gc/unusual_loot_lists.txt");
+    TestFilesystem::RemoveFile("csgo_gc/price_sheet.txt");
+    TestFilesystem::RemoveFile("csgo/scripts/items/items_game.txt");
+    TestFilesystem::RemoveDirectory("csgo/scripts/items");
+    TestFilesystem::RemoveDirectory("csgo/scripts");
+    TestFilesystem::RemoveDirectory("csgo");
+    TestFilesystem::RemoveDirectory("csgo_gc");
+}
+
+static bool StorePurchasesFinalizeTransactionally()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    RemoveStoreFixtures();
+    if (!WriteStoreFixtures())
+    {
+        RemoveStoreFixtures();
+        return false;
+    }
+
+    bool valid = true;
+    {
+        ClientGC gc{ SteamId };
+
+        CMsgClientHello hello;
+        SendGCProtobuf(gc, k_EMsgGCClientHello, hello);
+        EventData event;
+        CMsgClientWelcome welcome;
+        valid &= WaitForHostMessage(gc, k_EMsgGCClientWelcome, event)
+            && ParseHostProtobuf(event, welcome)
+            && welcome.outofdate_subscribed_caches_size() == 1;
+
+        uint64_t initialCacheVersion = welcome.outofdate_subscribed_caches_size() == 1
+            ? welcome.outofdate_subscribed_caches(0).version() : 0;
+        CMsgGCCStrike15_v2_MatchmakingGC2ClientHello matchmakingHello;
+        valid &= matchmakingHello.ParseFromString(welcome.game_data2());
+        uint32_t priceSheetVersion = matchmakingHello.global_stats().pricesheet_version();
+
+        CMsgStoreGetUserData storeData;
+        storeData.set_price_sheet_version(0);
+        SendGCProtobuf(gc, k_EMsgGCStoreGetUserData, storeData);
+        event = {};
+        CMsgStoreGetUserDataResponse storeDataResponse;
+        constexpr std::string_view DisabledMarketLink{
+            "market_link\0" "0\0", sizeof("market_link\0" "0\0") - 1
+        };
+        constexpr std::string_view CrateEntryWithPrices{
+            "\0" "crate_test\0"
+            "\1" "item_link\0" "crate_test\0"
+            "\1" "category_tags\0" "Misc\0"
+            "\0" "prices\0"
+            "\1" "USD\0" "99\0"
+            "\1" "CNY\0" "700\0"
+            "\x0b" "\x0b",
+            sizeof("\0" "crate_test\0"
+                "\1" "item_link\0" "crate_test\0"
+                "\1" "category_tags\0" "Misc\0"
+                "\0" "prices\0"
+                "\1" "USD\0" "99\0"
+                "\1" "CNY\0" "700\0"
+                "\x0b" "\x0b") - 1
+        };
+        valid &= WaitForHostMessage(gc, k_EMsgGCStoreGetUserDataResponse, event)
+            && ParseHostProtobuf(event, storeDataResponse)
+            && storeDataResponse.result() == 1
+            && storeDataResponse.price_sheet_version() == priceSheetVersion
+            && !storeDataResponse.price_sheet().empty()
+            && storeDataResponse.price_sheet().find("crate_test") != std::string::npos
+            && storeDataResponse.price_sheet().find(DisabledMarketLink) != std::string::npos
+            && storeDataResponse.price_sheet().find(CrateEntryWithPrices) != std::string::npos;
+
+        CMsgGCStorePurchaseInit purchaseInit;
+        CGCStorePurchaseInit_LineItem *lineItem = purchaseInit.add_line_items();
+        lineItem->set_item_def_id(8);
+        lineItem->set_quantity(2);
+        SendGCProtobuf(gc, k_EMsgGCStorePurchaseInit, purchaseInit);
+        event = {};
+        uint64_t authorizationTransactionId = 0;
+        CMsgGCStorePurchaseInitResponse initResponse;
+        valid &= WaitForHostMessage(gc, k_EMsgGCStorePurchaseInitResponse, event,
+                &authorizationTransactionId)
+            && ParseHostProtobuf(event, initResponse)
+            && initResponse.result() == 1
+            && initResponse.txn_id() != 0
+            && authorizationTransactionId == initResponse.txn_id()
+            && initResponse.item_ids_size() == 0;
+
+        CMsgClientHello currentHello;
+        CMsgSOCacheHaveVersion *haveVersion = currentHello.add_socache_have_versions();
+        haveVersion->mutable_soid()->set_type(SoIdTypeSteamId);
+        haveVersion->mutable_soid()->set_id(SteamId);
+        haveVersion->set_version(initialCacheVersion);
+        SendGCProtobuf(gc, k_EMsgGCClientHello, currentHello);
+        event = {};
+        welcome.Clear();
+        valid &= WaitForHostMessage(gc, k_EMsgGCClientWelcome, event)
+            && ParseHostProtobuf(event, welcome)
+            && welcome.uptodate_subscribed_caches_size() == 1;
+
+        CMsgGCStorePurchaseFinalize wrongFinalize;
+        wrongFinalize.set_txn_id(initResponse.txn_id() + 1);
+        SendGCProtobuf(gc, k_EMsgGCStorePurchaseFinalize, wrongFinalize);
+        event = {};
+        CMsgGCStorePurchaseFinalizeResponse finalizeResponse;
+        valid &= WaitForHostMessage(gc, k_EMsgGCStorePurchaseFinalizeResponse, event)
+            && ParseHostProtobuf(event, finalizeResponse)
+            && finalizeResponse.result() != 1
+            && finalizeResponse.item_ids_size() == 0;
+
+        CMsgGCStorePurchaseFinalize finalize;
+        finalize.set_txn_id(initResponse.txn_id());
+        SendGCProtobuf(gc, k_EMsgGCStorePurchaseFinalize, finalize);
+        event = {};
+        finalizeResponse.Clear();
+        valid &= WaitForHostMessage(gc, k_EMsgGCStorePurchaseFinalizeResponse, event)
+            && ParseHostProtobuf(event, finalizeResponse)
+            && finalizeResponse.result() == 1
+            && finalizeResponse.item_ids_size() == 2;
+
+        SendGCProtobuf(gc, k_EMsgGCClientHello, currentHello);
+        event = {};
+        welcome.Clear();
+        valid &= WaitForHostMessage(gc, k_EMsgGCClientWelcome, event)
+            && ParseHostProtobuf(event, welcome)
+            && welcome.outofdate_subscribed_caches_size() == 1;
+        if (welcome.outofdate_subscribed_caches_size() == 1)
+        {
+            const CMsgSOCacheSubscribed &subscription = welcome.outofdate_subscribed_caches(0);
+            valid &= subscription.version() != initialCacheVersion;
+
+            std::unordered_map<uint64_t, uint32_t> snapshotItems;
+            for (const CMsgSOCacheSubscribed_SubscribedType &type : subscription.objects())
+            {
+                if (type.type_id() != SOTypeItem)
+                {
+                    continue;
+                }
+                for (const std::string &objectData : type.object_data())
+                {
+                    CSOEconItem item;
+                    if (item.ParseFromString(objectData))
+                    {
+                        snapshotItems.emplace(item.id(), item.def_index());
+                    }
+                }
+            }
+
+            valid &= snapshotItems.size() == 2;
+            for (uint64_t itemId : finalizeResponse.item_ids())
+            {
+                auto item = snapshotItems.find(itemId);
+                valid &= item != snapshotItems.end() && item->second == 8;
+            }
+        }
+
+        SendGCProtobuf(gc, k_EMsgGCStorePurchaseFinalize, finalize);
+        event = {};
+        finalizeResponse.Clear();
+        valid &= WaitForHostMessage(gc, k_EMsgGCStorePurchaseFinalizeResponse, event)
+            && ParseHostProtobuf(event, finalizeResponse)
+            && finalizeResponse.result() != 1;
+    }
+
+    RemoveStoreFixtures();
+    return valid;
+}
+
+static bool StatsSubscriptionPurchasesRejectDuplicates()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    RemoveStoreFixtures();
+    if (!WriteStoreFixtures())
+    {
+        RemoveStoreFixtures();
+        return false;
+    }
+
+    bool valid = true;
+    uint64_t subscriptionItemId = 0;
+    {
+        ClientGC gc{ SteamId };
+        EventData event;
+        CMsgGCStorePurchaseInitResponse initResponse;
+
+        CMsgGCStorePurchaseInit invalidQuantity;
+        CGCStorePurchaseInit_LineItem *lineItem = invalidQuantity.add_line_items();
+        lineItem->set_item_def_id(ItemSchema::ItemStatsSubscription);
+        lineItem->set_quantity(2);
+        SendGCProtobuf(gc, k_EMsgGCStorePurchaseInit, invalidQuantity);
+        valid &= WaitForHostMessage(gc, k_EMsgGCStorePurchaseInitResponse, event)
+            && ParseHostProtobuf(event, initResponse)
+            && initResponse.result() != 1
+            && initResponse.item_ids_size() == 0;
+
+        CMsgGCStorePurchaseInit purchaseInit;
+        lineItem = purchaseInit.add_line_items();
+        lineItem->set_item_def_id(ItemSchema::ItemStatsSubscription);
+        lineItem->set_quantity(1);
+        SendGCProtobuf(gc, k_EMsgGCStorePurchaseInit, purchaseInit);
+        event = {};
+        initResponse.Clear();
+        uint64_t authorizationTransactionId = 0;
+        valid &= WaitForHostMessage(gc, k_EMsgGCStorePurchaseInitResponse, event,
+                &authorizationTransactionId)
+            && ParseHostProtobuf(event, initResponse)
+            && initResponse.result() == 1
+            && initResponse.txn_id() != 0
+            && authorizationTransactionId == initResponse.txn_id();
+
+        CMsgGCStorePurchaseFinalize finalize;
+        finalize.set_txn_id(initResponse.txn_id());
+        SendGCProtobuf(gc, k_EMsgGCStorePurchaseFinalize, finalize);
+        event = {};
+        CMsgGCStorePurchaseFinalizeResponse finalizeResponse;
+        valid &= WaitForHostMessage(gc, k_EMsgGCStorePurchaseFinalizeResponse, event)
+            && ParseHostProtobuf(event, finalizeResponse)
+            && finalizeResponse.result() == 1
+            && finalizeResponse.item_ids_size() == 1;
+        if (finalizeResponse.item_ids_size() == 1)
+        {
+            subscriptionItemId = finalizeResponse.item_ids(0);
+        }
+
+        SendGCProtobuf(gc, k_EMsgGCStorePurchaseInit, purchaseInit);
+        event = {};
+        initResponse.Clear();
+        valid &= WaitForHostMessage(gc, k_EMsgGCStorePurchaseInitResponse, event)
+            && ParseHostProtobuf(event, initResponse)
+            && initResponse.result() != 1
+            && initResponse.item_ids_size() == 0;
+    }
+
+    {
+        ClientGC gc{ SteamId };
+        CMsgGCStorePurchaseInit purchaseInit;
+        CGCStorePurchaseInit_LineItem *lineItem = purchaseInit.add_line_items();
+        lineItem->set_item_def_id(ItemSchema::ItemStatsSubscription);
+        lineItem->set_quantity(1);
+        SendGCProtobuf(gc, k_EMsgGCStorePurchaseInit, purchaseInit);
+
+        EventData event;
+        CMsgGCStorePurchaseInitResponse initResponse;
+        valid &= WaitForHostMessage(gc, k_EMsgGCStorePurchaseInitResponse, event)
+            && ParseHostProtobuf(event, initResponse)
+            && initResponse.result() != 1;
+    }
+
+    KeyValue persisted{ "inventory" };
+    valid &= subscriptionItemId
+        && persisted.ParseFromFile("csgo_gc/inventory.txt");
+    if (valid)
+    {
+        const KeyValue *items = persisted.GetSubkey("items");
+        size_t subscriptionCount = 0;
+        if (items)
+        {
+            for (const KeyValue &item : *items)
+            {
+                subscriptionCount += item.GetNumber<uint32_t>("def_index")
+                    == ItemSchema::ItemStatsSubscription;
+            }
+        }
+        valid &= items
+            && subscriptionCount == 1
+            && items->GetSubkey(std::to_string(subscriptionItemId >> 32));
+    }
+
+    RemoveStoreFixtures();
+    return valid;
+}
+
+static void RemovePrestigeFixtures()
+{
+    TestFilesystem::RemoveFile("csgo_gc/inventory.txt");
+    TestFilesystem::RemoveFile("csgo_gc/unusual_loot_lists.txt");
+    TestFilesystem::RemoveFile("csgo/scripts/items/items_game.txt");
+    TestFilesystem::RemoveFile("csgo/steam.inf");
+    TestFilesystem::RemoveDirectory("csgo/scripts/items");
+    TestFilesystem::RemoveDirectory("csgo/scripts");
+    TestFilesystem::RemoveDirectory("csgo");
+    TestFilesystem::RemoveDirectory("csgo_gc");
+}
+
+static bool WriteTextFile(const char *path, std::string_view contents)
+{
+    FILE *file = fopen(path, "wb");
+    if (!file)
+    {
+        return false;
+    }
+
+    bool written = fwrite(contents.data(), 1, contents.size(), file) == contents.size();
+    written &= fclose(file) == 0;
+    return written;
+}
+
+static bool WritePrestigeFixtures(std::string_view versionDate)
+{
+    if (!TestFilesystem::MakeDirectory("csgo")
+        || !TestFilesystem::MakeDirectory("csgo/scripts")
+        || !TestFilesystem::MakeDirectory("csgo/scripts/items")
+        || !TestFilesystem::MakeDirectory("csgo_gc"))
+    {
+        return false;
+    }
+
+    KeyValue schema{ "root" };
+    KeyValue &itemsGame = schema.AddSubkey("items_game");
+    itemsGame.AddSubkey("prefabs")
+        .AddSubkey("prestige_coin")
+        .AddString("item_type", "prestige_coin");
+
+    KeyValue &items = itemsGame.AddSubkey("items");
+    auto addMedal = [&](uint32_t defIndex, uint32_t year)
+    {
+        KeyValue &item = items.AddSubkey(std::to_string(defIndex));
+        item.AddString("name", std::string{ "prestige coin " }.append(std::to_string(year)));
+        item.AddString("prefab", "prestige_coin");
+        item.AddSubkey("attributes").AddNumber("prestige year", year);
+    };
+
+    addMedal(1376, 2019);
+    addMedal(1377, 2019);
+    addMedal(4873, 2023);
+    addMedal(4874, 2023);
+
+    KeyValue unusualLootLists{ "unusual_loot_lists" };
+    unusualLootLists.AddSubkey("empty");
+
+    KeyValue inventory{ "inventory" };
+    inventory.AddNumber("format_version", 1);
+    KeyValue &playerState = inventory.AddSubkey("player_state");
+    playerState.AddNumber("configured_level", GetConfig().Level());
+    playerState.AddNumber("configured_xp", GetConfig().Xp());
+    playerState.AddNumber("level", CSGOMaxPlayerLevel);
+    playerState.AddNumber("xp", 999);
+    inventory.AddSubkey("items");
+
+    std::string steamInf{ "ClientVersion=1569\nVersionDate=" };
+    steamInf.append(versionDate.data(), versionDate.size());
+    steamInf.push_back('\n');
+
+    return schema.WriteToFile("csgo/scripts/items/items_game.txt")
+        && unusualLootLists.WriteToFile("csgo_gc/unusual_loot_lists.txt")
+        && inventory.WriteToFile("csgo_gc/inventory.txt")
+        && WriteTextFile("csgo/steam.inf", steamInf);
+}
+
+static bool SetPersistedPlayerProgress(int level, int xp)
+{
+    KeyValue inventory{ "inventory" };
+    if (!inventory.ParseFromFile("csgo_gc/inventory.txt"))
+    {
+        return false;
+    }
+
+    KeyValue *playerState = inventory.GetSubkey("player_state");
+    if (!playerState)
+    {
+        return false;
+    }
+
+    playerState->SetString("level", std::to_string(level));
+    playerState->SetString("xp", std::to_string(xp));
+    return inventory.WriteToFile("csgo_gc/inventory.txt");
+}
+
+static bool PersistedPlayerProgressIs(int level, int xp)
+{
+    KeyValue inventory{ "inventory" };
+    if (!inventory.ParseFromFile("csgo_gc/inventory.txt"))
+    {
+        return false;
+    }
+
+    const KeyValue *playerState = inventory.GetSubkey("player_state");
+    return playerState
+        && playerState->GetNumber<int>("level") == level
+        && playerState->GetNumber<int>("xp") == xp;
+}
+
+static bool PersistedItemHasDefIndex(uint64_t itemId, uint32_t defIndex)
+{
+    KeyValue inventory{ "inventory" };
+    if (!inventory.ParseFromFile("csgo_gc/inventory.txt"))
+    {
+        return false;
+    }
+
+    const KeyValue *items = inventory.GetSubkey("items");
+    if (!items)
+    {
+        return false;
+    }
+
+    const KeyValue *item = items->GetSubkey(std::to_string(itemId >> 32));
+    return item && item->GetNumber<uint32_t>("def_index") == defIndex;
+}
+
+static bool RequestPrestigeInquiry(ClientGC &gc,
+    CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin &response)
+{
+    CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin request;
+    SendGCProtobuf(gc, k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin, request);
+
+    EventData event;
+    return WaitForHostMessage(gc, k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin, event)
+        && ParseHostProtobuf(event, response);
+}
+
+static bool RequestPrestigeJob(ClientGC &gc,
+    const CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin &request,
+    uint64_t jobId,
+    CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin &response)
+{
+    EventData event;
+    return SendGCProtobufJob(gc,
+        k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin,
+        request,
+        jobId)
+        && WaitForHostMessage(gc,
+            k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin,
+            event)
+        && ParseHostJobProtobuf(event, jobId, response);
+}
+
+static bool ValidatePrestigeClaimEvents(const std::vector<EventData> &events,
+    bool expectedCreate, uint32_t expectedDefIndex, uint64_t expectedItemId,
+    uint64_t &actualItemId)
+{
+    size_t itemEventIndex = events.size();
+    size_t responseEventIndex = events.size();
+    bool foundPersona = false;
+    bool foundMatchmakingHello = false;
+    bool foundResponse = false;
+    CMsgSOSingleObject itemData;
+    CMsgSOSingleObject personaData;
+    CSOEconItem item;
+    CSOPersonaDataPublic persona;
+    CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin response;
+
+    for (size_t i = 0; i < events.size(); i++)
+    {
+        uint32_t type = static_cast<uint32_t>(events[i].id) & ~ProtobufMask;
+        if (type == k_ESOMsg_Create || type == k_ESOMsg_Update)
+        {
+            CMsgSOSingleObject object;
+            if (!ParseHostProtobuf(events[i], object))
+            {
+                return false;
+            }
+
+            if (object.type_id() == SOTypeItem)
+            {
+                uint32_t expectedType = expectedCreate
+                    ? static_cast<uint32_t>(k_ESOMsg_Create)
+                    : static_cast<uint32_t>(k_ESOMsg_Update);
+                if (type != expectedType
+                    || !item.ParseFromString(object.object_data()))
+                {
+                    return false;
+                }
+                itemData = object;
+                itemEventIndex = i;
+            }
+            else if (object.type_id() == SOTypePersonaDataPublic)
+            {
+                if (!persona.ParseFromString(object.object_data()))
+                {
+                    return false;
+                }
+                personaData = object;
+                foundPersona = true;
+            }
+        }
+        else if (type == k_EMsgGCCStrike15_v2_MatchmakingGC2ClientHello)
+        {
+            CMsgGCCStrike15_v2_MatchmakingGC2ClientHello hello;
+            foundMatchmakingHello = ParseHostProtobuf(events[i], hello)
+                && hello.player_level() == 1
+                && hello.player_cur_xp() == 0;
+        }
+        else if (type == k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin)
+        {
+            foundResponse = ParseHostProtobuf(events[i], response);
+            responseEventIndex = i;
+        }
+    }
+
+    actualItemId = item.id();
+    return itemEventIndex < responseEventIndex
+        && item.def_index() == expectedDefIndex
+        && (!expectedItemId || item.id() == expectedItemId)
+        && item.origin() == ItemOriginLevelUpReward
+        && (!expectedCreate
+            || item.inventory() == InventoryUnacknowledged(UnacknowledgedLevelUpReward))
+        && foundPersona
+        && persona.player_level() == 1
+        && itemData.version() < personaData.version()
+        && foundMatchmakingHello
+        && foundResponse
+        && response.defindex() == expectedDefIndex
+        && response.upgradeid() == item.id()
+        && response.prestigetime() != 0;
+}
+
+static bool ServiceMedalsFollowBuildYearAndPersistPrestige()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    RemovePrestigeFixtures();
+
+    bool valid = WritePrestigeFixtures("Mar 28 2019");
+    if (valid)
+    {
+        ClientGC gc{ SteamId };
+        CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin response;
+        valid &= RequestPrestigeInquiry(gc, response)
+            && response.defindex() == 1376
+            && !response.has_upgradeid()
+            && !response.has_prestigetime();
+
+        constexpr uint64_t InquiryJobId = 101;
+        CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin jobRequest;
+        response.Clear();
+        valid &= RequestPrestigeJob(gc, jobRequest, InquiryJobId, response)
+            && response.defindex() == 1376
+            && !response.has_upgradeid()
+            && !response.has_prestigetime();
+
+        constexpr uint64_t MalformedJobId = 102;
+        constexpr uint8_t MalformedRequest[]{ 0x80 };
+        EventData event;
+        response.Clear();
+        valid &= SendGCProtobufJobData(gc,
+            k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin,
+            MalformedRequest,
+            sizeof(MalformedRequest),
+            MalformedJobId)
+            && WaitForHostMessage(gc,
+                k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin,
+                event)
+            && ParseHostJobProtobuf(event, MalformedJobId, response)
+            && response.ByteSizeLong() == 0;
+    }
+
+    RemovePrestigeFixtures();
+    valid &= WritePrestigeFixtures("invalid");
+
+    uint64_t medalItemId = 0;
+    if (valid)
+    {
+        ClientGC gc{ SteamId };
+        CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin inquiry;
+        valid &= RequestPrestigeInquiry(gc, inquiry)
+            && inquiry.defindex() == 4873
+            && !inquiry.has_upgradeid();
+
+        CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin staleClaim;
+        staleClaim.set_defindex(4874);
+        SendGCProtobuf(gc, k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin, staleClaim);
+        valid &= HostMessageNotReceived(gc,
+            k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin);
+
+        constexpr uint64_t StaleClaimJobId = 103;
+        CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin rejectedResponse;
+        valid &= RequestPrestigeJob(gc, staleClaim, StaleClaimJobId, rejectedResponse)
+            && rejectedResponse.ByteSizeLong() == 0;
+
+        inquiry.Clear();
+        valid &= RequestPrestigeInquiry(gc, inquiry) && inquiry.defindex() == 4873;
+
+        CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin claim;
+        claim.set_defindex(4873);
+        SendGCProtobuf(gc, k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin, claim);
+
+        std::vector<EventData> events;
+        valid &= WaitForHostMessagesUntil(gc,
+            k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin, events)
+            && ValidatePrestigeClaimEvents(events, true, 4873, 0, medalItemId);
+
+        CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin ineligibleInquiry;
+        SendGCProtobuf(gc, k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin,
+            ineligibleInquiry);
+        valid &= HostMessageNotReceived(gc,
+            k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin);
+
+        constexpr uint64_t IneligibleJobId = 104;
+        rejectedResponse.Clear();
+        valid &= RequestPrestigeJob(gc,
+            ineligibleInquiry,
+            IneligibleJobId,
+            rejectedResponse)
+            && rejectedResponse.ByteSizeLong() == 0;
+    }
+
+    valid &= medalItemId != 0
+        && PersistedPlayerProgressIs(1, 0)
+        && PersistedItemHasDefIndex(medalItemId, 4873);
+
+    if (valid)
+    {
+        ClientGC gc{ SteamId };
+        CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin inquiry;
+        SendGCProtobuf(gc, k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin, inquiry);
+        valid &= HostMessageNotReceived(gc,
+            k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin);
+
+        CMsgClientHello hello;
+        SendGCProtobuf(gc, k_EMsgGCClientHello, hello);
+        EventData event;
+        CMsgClientWelcome welcome;
+        CMsgGCCStrike15_v2_MatchmakingGC2ClientHello matchmakingHello;
+        valid &= WaitForHostMessage(gc, k_EMsgGCClientWelcome, event)
+            && ParseHostProtobuf(event, welcome)
+            && matchmakingHello.ParseFromString(welcome.game_data2())
+            && matchmakingHello.player_level() == 1
+            && matchmakingHello.player_cur_xp() == 0;
+    }
+
+    valid &= SetPersistedPlayerProgress(CSGOMaxPlayerLevel, 999);
+    if (valid)
+    {
+        ClientGC gc{ SteamId };
+        CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin inquiry;
+        valid &= RequestPrestigeInquiry(gc, inquiry)
+            && inquiry.defindex() == 4874
+            && inquiry.upgradeid() == medalItemId;
+
+        CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin claim;
+        claim.set_defindex(4874);
+        SendGCProtobuf(gc, k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin, claim);
+
+        std::vector<EventData> events;
+        uint64_t upgradedItemId = 0;
+        valid &= WaitForHostMessagesUntil(gc,
+            k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin, events)
+            && ValidatePrestigeClaimEvents(events, false, 4874, medalItemId, upgradedItemId)
+            && upgradedItemId == medalItemId;
+    }
+
+    valid &= PersistedPlayerProgressIs(1, 0)
+        && PersistedItemHasDefIndex(medalItemId, 4874)
+        && SetPersistedPlayerProgress(CSGOMaxPlayerLevel, 999);
+
+    if (valid)
+    {
+        ClientGC gc{ SteamId };
+        CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin inquiry;
+        SendGCProtobuf(gc, k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin, inquiry);
+        valid &= HostMessageNotReceived(gc,
+            k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin);
+
+        constexpr uint64_t MissingPlanJobId = 105;
+        CMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin rejectedResponse;
+        valid &= RequestPrestigeJob(gc,
+            inquiry,
+            MissingPlanJobId,
+            rejectedResponse)
+            && rejectedResponse.ByteSizeLong() == 0;
+    }
+
+    RemovePrestigeFixtures();
+    return valid;
+}
+
+static void RemoveTournamentAccessFixtures()
+{
+    TestFilesystem::RemoveFile("csgo_gc/inventory.txt");
+    TestFilesystem::RemoveFile("csgo_gc/unusual_loot_lists.txt");
+    TestFilesystem::RemoveFile("csgo_gc/gc_loot_lists.txt");
+    TestFilesystem::RemoveFile("csgo/scripts/items/items_game.txt");
+    TestFilesystem::RemoveDirectory("csgo/scripts/items");
+    TestFilesystem::RemoveDirectory("csgo/scripts");
+    TestFilesystem::RemoveDirectory("csgo");
+    TestFilesystem::RemoveDirectory("csgo_gc");
+}
+
+static bool WriteTournamentAccessFixtures(std::initializer_list<uint32_t> inventoryDefIndexes)
+{
+    if (!TestFilesystem::MakeDirectory("csgo")
+        || !TestFilesystem::MakeDirectory("csgo/scripts")
+        || !TestFilesystem::MakeDirectory("csgo/scripts/items")
+        || !TestFilesystem::MakeDirectory("csgo_gc"))
+    {
+        return false;
+    }
+
+    KeyValue schema{ "root" };
+    KeyValue &itemsGame = schema.AddSubkey("items_game");
+    KeyValue &attributes = itemsGame.AddSubkey("attributes");
+    auto addIntegerAttribute = [&](uint32_t defIndex, const char *name)
+    {
+        KeyValue &attribute = attributes.AddSubkey(std::to_string(defIndex));
+        attribute.AddString("name", name);
+        attribute.AddNumber("stored_as_integer", 1);
+    };
+    addIntegerAttribute(ItemSchema::AttributeStickerId0, "sticker slot 0 id");
+    addIntegerAttribute(ItemSchema::AttributeTournamentEventId, "tournament event id");
+    addIntegerAttribute(ItemSchema::AttributeCampaignId, "campaign id");
+    addIntegerAttribute(ItemSchema::AttributeCampaignCompletionBitfield,
+        "campaign completion bitfield");
+    addIntegerAttribute(ItemSchema::AttributeOperationDropsAwardedPurchased,
+        "operation drops awarded 1");
+    addIntegerAttribute(ItemSchema::AttributeOperationDropsAwardedRedeemed,
+        "operation drops awarded 0");
+
+    KeyValue &prefabs = itemsGame.AddSubkey("prefabs");
+    prefabs.AddSubkey("fan_token");
+    prefabs.AddSubkey("fan_shield");
+
+    KeyValue &passPrefab = prefabs.AddSubkey("paris_pass");
+    passPrefab.AddString("prefab", "fan_token");
+    KeyValue &passEvent = passPrefab.AddSubkey("attributes")
+        .AddSubkey("tournament event id");
+    passEvent.AddNumber("value", 21);
+
+    KeyValue &journalPrefab = prefabs.AddSubkey("paris_journal");
+    journalPrefab.AddString("prefab", "fan_shield");
+    KeyValue &journalAttributes = journalPrefab.AddSubkey("attributes");
+    journalAttributes.AddSubkey("tournament event id").AddNumber("value", 21);
+    auto addGenerated = [&](const char *name, uint32_t value)
+    {
+        KeyValue &attribute = journalAttributes.AddSubkey(name);
+        attribute.AddNumber("value", value);
+        attribute.AddNumber("force_gc_to_generate", 1);
+    };
+    addGenerated("sticker slot 0 id", 6732);
+    addGenerated("campaign id", 15);
+    addGenerated("campaign completion bitfield", 1);
+    addGenerated("operation drops awarded 1", 0);
+    addGenerated("operation drops awarded 0", 0);
+
+    KeyValue &items = itemsGame.AddSubkey("items");
+    auto addItemDefinition = [&](uint32_t defIndex, const char *name, const char *prefab)
+    {
+        KeyValue &item = items.AddSubkey(std::to_string(defIndex));
+        item.AddString("name", name);
+        item.AddString("prefab", prefab);
+    };
+    addItemDefinition(100, "tournament_pass_paris2023", "paris_pass");
+    addItemDefinition(101, "tournament_pass_paris2023_pack", "paris_pass");
+    addItemDefinition(102, "tournament_pass_paris2023_charge", "paris_pass");
+    addItemDefinition(200, "tournament_journal_paris2023", "paris_journal");
+
+    KeyValue inventory{ "inventory" };
+    inventory.AddNumber("format_version", 1);
+    KeyValue &inventoryItems = inventory.AddSubkey("items");
+    uint32_t highItemId = 1;
+    for (uint32_t defIndex : inventoryDefIndexes)
+    {
+        KeyValue &item = inventoryItems.AddSubkey(std::to_string(highItemId++));
+        item.AddNumber("def_index", defIndex);
+        item.AddNumber("origin", ItemOriginPurchased);
+    }
+
+    KeyValue unusualLootLists{ "unusual_loot_lists" };
+    KeyValue gcLootLists{ "gc_loot_lists" };
+    return schema.WriteToFile("csgo/scripts/items/items_game.txt")
+        && inventory.WriteToFile("csgo_gc/inventory.txt")
+        && unusualLootLists.WriteToFile("csgo_gc/unusual_loot_lists.txt")
+        && gcLootLists.WriteToFile("csgo_gc/gc_loot_lists.txt");
+}
+
+static uint64_t TournamentFixtureItemId(uint64_t steamId, uint32_t highItemId)
+{
+    return (static_cast<uint64_t>(highItemId) << 32) | (steamId & UINT32_MAX);
+}
+
+static bool ValidateTournamentActivationEvents(const std::vector<EventData> &events,
+    uint64_t consumedItemId, uint32_t journalMessageType, uint32_t expectedTokens,
+    uint64_t &journalItemId)
+{
+    size_t destroyIndex = events.size();
+    size_t journalIndex = events.size();
+    size_t notificationIndex = events.size();
+    CSOEconItem journal;
+    bool valid = true;
+
+    for (size_t i = 0; i < events.size(); i++)
+    {
+        const uint32_t type = static_cast<uint32_t>(events[i].id) & ~ProtobufMask;
+        if (type == k_ESOMsg_Destroy)
+        {
+            CMsgSOSingleObject object;
+            CSOEconItem consumed;
+            valid &= destroyIndex == events.size()
+                && ParseHostProtobuf(events[i], object)
+                && ParseItemObject(object, consumed)
+                && consumed.id() == consumedItemId;
+            destroyIndex = i;
+        }
+        else if (type == journalMessageType)
+        {
+            CMsgSOSingleObject object;
+            valid &= journalIndex == events.size()
+                && ParseHostProtobuf(events[i], object)
+                && ParseItemObject(object, journal)
+                && journal.def_index() == 200;
+            journalIndex = i;
+        }
+        else if (type == k_EMsgGCItemCustomizationNotification)
+        {
+            CMsgGCItemCustomizationNotification notification;
+            const bool parsed = ParseHostProtobuf(events[i], notification);
+            valid &= notificationIndex == events.size()
+                && parsed
+                && notification.request()
+                    == k_EGCItemCustomizationNotification_ActivateFanToken
+                && notification.item_id_size() == 1;
+            if (parsed && notification.item_id_size() == 1)
+            {
+                journalItemId = notification.item_id(0);
+            }
+            notificationIndex = i;
+        }
+    }
+
+    uint32_t tokenCount = 0;
+    valid &= destroyIndex < journalIndex
+        && journalIndex < notificationIndex
+        && journal.id() == journalItemId
+        && GetUint32Attribute(journal,
+            ItemSchema::AttributeOperationDropsAwardedPurchased, tokenCount)
+        && tokenCount == expectedTokens;
+    return valid;
+}
+
+static bool ViewerPassActivationCreatesAndPersistsJournal()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    RemoveTournamentAccessFixtures();
+    if (!WriteTournamentAccessFixtures({ 100, 100 }))
+    {
+        RemoveTournamentAccessFixtures();
+        return false;
+    }
+
+    const uint64_t passId = TournamentFixtureItemId(SteamId, 1);
+    const uint64_t duplicatePassId = TournamentFixtureItemId(SteamId, 2);
+    uint64_t journalId = 0;
+    bool valid = true;
+    {
+        ClientGC gc{ SteamId };
+        CMsgUseItem request;
+        request.set_item_id(passId);
+        SendGCProtobuf(gc, k_EMsgGCUseItemRequest, request);
+
+        std::vector<EventData> events;
+        valid &= WaitForHostMessagesUntil(gc,
+            k_EMsgGCItemCustomizationNotification, events)
+            && ValidateTournamentActivationEvents(events, passId,
+                k_ESOMsg_Create, 0, journalId);
+
+        request.set_item_id(duplicatePassId);
+        SendGCProtobuf(gc, k_EMsgGCUseItemRequest, request);
+        valid &= HostMessageNotReceived(gc, k_EMsgGCItemCustomizationNotification);
+    }
+
+    {
+        Inventory persisted{ SteamId };
+        const CSOEconItem *journal = persisted.GetItem(journalId);
+        uint32_t stickerId = 0;
+        uint32_t campaignId = 0;
+        uint32_t completion = 0;
+        uint32_t purchased = 0;
+        uint32_t redeemed = 0;
+        valid &= !persisted.GetItem(passId)
+            && persisted.GetItem(duplicatePassId)
+            && journal
+            && journal->origin() == ItemOriginPurchased
+            && journal->inventory() == InventoryUnacknowledged(UnacknowledgedPurchased)
+            && GetUint32Attribute(*journal, ItemSchema::AttributeStickerId0, stickerId)
+            && stickerId == 6732
+            && GetUint32Attribute(*journal, ItemSchema::AttributeCampaignId, campaignId)
+            && campaignId == 15
+            && GetUint32Attribute(*journal,
+                ItemSchema::AttributeCampaignCompletionBitfield, completion)
+            && completion == 1
+            && GetUint32Attribute(*journal,
+                ItemSchema::AttributeOperationDropsAwardedPurchased, purchased)
+            && purchased == 0
+            && GetUint32Attribute(*journal,
+                ItemSchema::AttributeOperationDropsAwardedRedeemed, redeemed)
+            && redeemed == 0;
+    }
+
+    RemoveTournamentAccessFixtures();
+    return valid;
+}
+
+static bool ViewerPassTokenPacksUpdatePersistedJournal()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    RemoveTournamentAccessFixtures();
+    if (!WriteTournamentAccessFixtures({ 101, 102 }))
+    {
+        RemoveTournamentAccessFixtures();
+        return false;
+    }
+
+    const uint64_t packId = TournamentFixtureItemId(SteamId, 1);
+    const uint64_t tokenId = TournamentFixtureItemId(SteamId, 2);
+    uint64_t journalId = 0;
+    bool valid = true;
+    {
+        ClientGC gc{ SteamId };
+        CMsgUseItem request;
+        request.set_item_id(packId);
+        SendGCProtobuf(gc, k_EMsgGCUseItemRequest, request);
+
+        std::vector<EventData> events;
+        valid &= WaitForHostMessagesUntil(gc,
+            k_EMsgGCItemCustomizationNotification, events)
+            && ValidateTournamentActivationEvents(events, packId,
+                k_ESOMsg_Create, 3, journalId);
+
+        request.set_item_id(tokenId);
+        SendGCProtobuf(gc, k_EMsgGCUseItemRequest, request);
+        events.clear();
+        uint64_t updatedJournalId = 0;
+        valid &= WaitForHostMessagesUntil(gc,
+            k_EMsgGCItemCustomizationNotification, events)
+            && ValidateTournamentActivationEvents(events, tokenId,
+                k_ESOMsg_Update, 4, updatedJournalId)
+            && updatedJournalId == journalId;
+    }
+
+    {
+        Inventory persisted{ SteamId };
+        const CSOEconItem *journal = persisted.GetItem(journalId);
+        uint32_t purchased = 0;
+        valid &= !persisted.GetItem(packId)
+            && !persisted.GetItem(tokenId)
+            && journal
+            && GetUint32Attribute(*journal,
+                ItemSchema::AttributeOperationDropsAwardedPurchased, purchased)
+            && purchased == 4;
+    }
+
+    RemoveTournamentAccessFixtures();
+    valid &= WriteTournamentAccessFixtures({ 102 });
+    if (valid)
+    {
+        ClientGC gc{ SteamId };
+        CMsgUseItem request;
+        request.set_item_id(TournamentFixtureItemId(SteamId, 1));
+        SendGCProtobuf(gc, k_EMsgGCUseItemRequest, request);
+        valid &= HostMessageNotReceived(gc, k_EMsgGCItemCustomizationNotification);
+    }
+    {
+        Inventory persisted{ SteamId };
+        valid &= persisted.GetItem(TournamentFixtureItemId(SteamId, 1)) != nullptr;
+    }
+
+    RemoveTournamentAccessFixtures();
+    return valid;
+}
+
+static bool SouvenirTokenInitializesMissingPurchasedCount()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    RemoveTournamentAccessFixtures();
+    if (!WriteTournamentAccessFixtures({ 200, 102 }))
+    {
+        RemoveTournamentAccessFixtures();
+        return false;
+    }
+
+    const uint64_t journalId = TournamentFixtureItemId(SteamId, 1);
+    const uint64_t tokenId = TournamentFixtureItemId(SteamId, 2);
+    bool valid = true;
+    {
+        ClientGC gc{ SteamId };
+        CMsgUseItem request;
+        request.set_item_id(tokenId);
+        SendGCProtobuf(gc, k_EMsgGCUseItemRequest, request);
+
+        std::vector<EventData> events;
+        uint64_t updatedJournalId = 0;
+        valid &= WaitForHostMessagesUntil(gc,
+            k_EMsgGCItemCustomizationNotification, events)
+            && ValidateTournamentActivationEvents(events, tokenId,
+                k_ESOMsg_Update, 1, updatedJournalId)
+            && updatedJournalId == journalId;
+    }
+
+    {
+        Inventory persisted{ SteamId };
+        const CSOEconItem *journal = persisted.GetItem(journalId);
+        uint32_t purchased = 0;
+        valid &= !persisted.GetItem(tokenId)
+            && journal
+            && GetUint32Attribute(*journal,
+                ItemSchema::AttributeOperationDropsAwardedPurchased, purchased)
+            && purchased == 1;
+    }
+
+    RemoveTournamentAccessFixtures();
+    return valid;
+}
+
+static bool RequestEventFavorites(ClientGC &gc, bool allEvents, uint64_t jobId,
+    std::string_view expectedFavorites)
+{
+    CMsgGCCStrike15_v2_GetEventFavorites_Request request;
+    request.set_all_events(allEvents);
+    if (!SendGCProtobufJob(gc,
+        k_EMsgGCCStrike15_v2_GetEventFavorites_Request, request, jobId))
+    {
+        return false;
+    }
+
+    EventData event;
+    CMsgGCCStrike15_v2_GetEventFavorites_Response response;
+    return WaitForHostMessage(gc,
+            k_EMsgGCCStrike15_v2_GetEventFavorites_Response, event)
+        && ParseHostJobProtobuf(event, jobId, response)
+        && response.all_events() == allEvents
+        && response.json_favorites() == expectedFavorites
+        && response.json_featured() == "[]";
+}
+
+static bool EventFavoritesPersistAndPreserveRequestJobs()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    constexpr const char *InventoryPath = "csgo_gc/inventory.txt";
+    TestFilesystem::RemoveFile(InventoryPath);
+    if (!TestFilesystem::MakeDirectory("csgo_gc"))
+    {
+        return false;
+    }
+
+    bool valid = true;
+    {
+        ClientGC gc{ SteamId };
+        CMsgGCCStrike15_v2_SetEventFavorite favorite;
+        favorite.set_eventid(21);
+        favorite.set_is_favorite(true);
+        SendGCProtobuf(gc, k_EMsgGCCStrike15_v2_SetEventFavorite, favorite);
+
+        favorite.set_eventid(7);
+        SendGCProtobuf(gc, k_EMsgGCCStrike15_v2_SetEventFavorite, favorite);
+
+        valid &= RequestEventFavorites(gc, true, 7001, "[7,21]");
+    }
+
+    {
+        ClientGC gc{ SteamId };
+        valid &= RequestEventFavorites(gc, false, 7002, "[7,21]");
+
+        CMsgGCCStrike15_v2_SetEventFavorite favorite;
+        favorite.set_eventid(7);
+        favorite.set_is_favorite(false);
+        SendGCProtobuf(gc, k_EMsgGCCStrike15_v2_SetEventFavorite, favorite);
+        valid &= RequestEventFavorites(gc, true, 7003, "[21]");
+    }
+
+    {
+        Inventory persisted{ SteamId };
+        valid &= persisted.EventFavorites() == std::set<uint64_t>{ 21 };
+    }
+
+    TestFilesystem::RemoveFile(InventoryPath);
+    TestFilesystem::RemoveDirectory("csgo_gc");
+    return valid;
+}
+
+static bool OwnedOnlyPolicyAllowsAuthoritativeInventoryStructMessages()
+{
+    return IsOwnedOnlyClientMessageAllowed(k_EMsgGCUnlockCrate, false)
+        && !IsOwnedOnlyClientMessageAllowed(k_EMsgGCUnlockCrate, true)
+        && IsOwnedOnlyClientMessageAllowed(k_EMsgGCCraft, false)
+        && !IsOwnedOnlyClientMessageAllowed(k_EMsgGCCraft, true)
+        && IsOwnedOnlyClientMessageAllowed(k_EMsgGCClientHello, true)
+        && IsOwnedOnlyClientMessageAllowed(k_EMsgGCAdjustItemEquippedState, true)
+        && IsOwnedOnlyClientMessageAllowed(k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin, true)
+        && !IsOwnedOnlyClientMessageAllowed(k_EMsgGCCStrike15_v2_Client2GCRequestPrestigeCoin, false)
+        && !IsOwnedOnlyClientMessageAllowed(k_EMsgGCDelete, false)
+        && !IsOwnedOnlyClientMessageAllowed(k_EMsgGCStoreGetUserData, true);
+}
+
+static bool OwnedInventoryRequiresExactImmutableItems()
+{
+    constexpr uint64_t steamId = 76561198000000001ULL;
+    constexpr uint64_t assetId = 76561199000000002ULL;
+    if (!TestFilesystem::MakeDirectory("csgo")
+        || !TestFilesystem::MakeDirectory("csgo/scripts")
+        || !TestFilesystem::MakeDirectory("csgo/scripts/items")
+        || !TestFilesystem::MakeDirectory("csgo_gc"))
+    {
+        return false;
+    }
+
+    KeyValue schemaRoot{ "root" };
+    KeyValue &itemsGame = schemaRoot.AddSubkey("items_game");
+    KeyValue &attributes = itemsGame.AddSubkey("attributes");
+    attributes.AddSubkey("6").AddNumber("stored_as_integer", 1);
+    attributes.AddSubkey("7").AddNumber("stored_as_integer", 1);
+    attributes.AddSubkey("8").AddString("attribute_type", "float");
+    itemsGame.AddSubkey("items").AddSubkey("7").AddString("name", "weapon_ak47");
+
+    KeyValue manifest{ "b2g_owned_manifest" };
+    manifest.AddNumber("format_version", 1);
+    KeyValue &item = manifest.AddSubkey("players")
+        .AddSubkey(std::to_string(steamId)).AddSubkey("items")
+        .AddSubkey(std::to_string(assetId));
+    item.AddNumber("inventory", 1);
+    item.AddNumber("def_index", 7);
+    item.AddString("source", "b2g");
+    item.AddString("item_kind", "cosmetic");
+    item.AddNumber("level", 1);
+    item.AddNumber("quality", 3);
+    item.AddNumber("flags", 0);
+    item.AddNumber("origin", ItemOriginTraded);
+    item.AddString("custom_name", "Owned only");
+    item.AddNumber("in_use", 0);
+    item.AddNumber("rarity", ItemSchema::RarityMythical);
+    item.AddNumber("loadout_slot", 15);
+    KeyValue &itemAttributes = item.AddSubkey("attributes");
+    itemAttributes.AddNumber("6", 302);
+    itemAttributes.AddNumber("7", 511);
+    itemAttributes.AddString("8", "0.125");
+    item.AddSubkey("equipped_state").AddNumber("2", 15);
+
+    KeyValue unusualLootLists{ "unusual_loot_lists" };
+    KeyValue gcLootLists{ "gc_loot_lists" };
+    bool valid = schemaRoot.WriteToFile("csgo/scripts/items/items_game.txt")
+        && manifest.WriteToFile(B2GOwnedManifestPath)
+        && unusualLootLists.WriteToFile("csgo_gc/unusual_loot_lists.txt")
+        && gcLootLists.WriteToFile("csgo_gc/gc_loot_lists.txt");
+    if (valid)
+    {
+        ItemSchema schema;
+        B2GOwnedItems owned;
+        std::string error;
+        valid &= LoadB2GOwnedItems(steamId, schema, owned, error)
+            && owned.size() == 1 && owned.contains(assetId)
+            && owned.at(assetId).source == B2GOwnedItemSource::B2G
+            && owned.at(assetId).kind == B2GOwnedItemKind::Cosmetic;
+        if (valid)
+        {
+            CSOEconItem exact = owned.at(assetId).item;
+            valid &= IsExactB2GOwnedItem(exact, owned.at(assetId));
+            exact.set_quality(exact.quality() + 1);
+            valid &= !IsExactB2GOwnedItem(exact, owned.at(assetId));
+            exact = owned.at(assetId).item;
+            exact.mutable_equipped_state(0)->set_new_slot(16);
+            valid &= !IsExactB2GOwnedItem(exact, owned.at(assetId));
+        }
+    }
+
+    TestFilesystem::RemoveFile(B2GOwnedManifestPath);
+    return valid;
+}
+
+static bool LauncherProfilesPublishAuthoritativePartyState()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    ClientGC gc{ SteamId };
+    LauncherBridge::PlayerProfilesHeader header{};
+    header.hasRequestId = 1;
+    header.requestId = 42;
+    header.count = 2;
+    const LauncherBridge::PlayerProfileWire profiles[]{
+        { 39734273, 11, 42, 4, 380 },
+        { 39734274, 18, 900, 40, 999 },
+    };
+    std::vector<uint8_t> payload(sizeof(header) + sizeof(profiles));
+    std::memcpy(payload.data(), &header, sizeof(header));
+    std::memcpy(payload.data() + sizeof(header), profiles, sizeof(profiles));
+    gc.PostToGC(GCEvent::LauncherBridgeMessage,
+        static_cast<uint16_t>(LauncherBridge::MessageType::PlayerProfiles),
+        payload.data(), static_cast<uint32_t>(payload.size()));
+
+    EventData event;
+    CMsgGCCStrike15_v2_PlayersProfile response;
+    bool valid = WaitForHostMessage(gc, k_EMsgGCCStrike15_v2_PlayersProfile, event)
+        && ParseHostProtobuf(event, response)
+        && response.has_request_id() && response.request_id() == 42
+        && response.account_profiles_size() == 2;
+    if (!valid)
+    {
+        return false;
+    }
+    for (int index = 0; index < response.account_profiles_size(); ++index)
+    {
+        const auto &profile = response.account_profiles(index);
+        const auto &expected = profiles[index];
+        valid &= profile.account_id() == expected.accountId
+            && profile.has_ranking()
+            && profile.ranking().account_id() == expected.accountId
+            && profile.ranking().rank_id() == expected.rankId
+            && profile.ranking().wins() == expected.wins
+            && profile.ranking().rank_type_id() == RankTypeCompetitive
+            && profile.rankings_size() == 1
+            && profile.player_level() == static_cast<int32_t>(expected.playerLevel)
+            && profile.player_cur_xp() == static_cast<int32_t>(expected.playerXp);
+    }
+
+    auto invalid = profiles[0];
+    invalid.rankId = RankGlobalElite + 1;
+    header.count = 1;
+    payload.resize(sizeof(header) + sizeof(invalid));
+    std::memcpy(payload.data(), &header, sizeof(header));
+    std::memcpy(payload.data() + sizeof(header), &invalid, sizeof(invalid));
+    gc.PostToGC(GCEvent::LauncherBridgeMessage,
+        static_cast<uint16_t>(LauncherBridge::MessageType::PlayerProfiles),
+        payload.data(), static_cast<uint32_t>(payload.size()));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{ 100 };
+    std::vector<EventData> events;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        gc.GetHostEvents(events);
+        if (std::any_of(events.begin(), events.end(), [](const EventData &candidate) {
+                return candidate.type == static_cast<int>(HostEvent::Message)
+                    && (candidate.id & ~ProtobufMask)
+                        == k_EMsgGCCStrike15_v2_PlayersProfile;
+            }))
+        {
+            return false;
+        }
+        events.clear();
+        std::this_thread::yield();
+    }
+    return valid;
+}
+
+static bool LauncherStatePublishesAuthoritativeLocalProfile()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    ClientGC gc{ SteamId };
+
+    CMsgClientHello clientHello;
+    SendGCProtobuf(gc, k_EMsgGCClientHello, clientHello);
+    EventData event;
+    CMsgClientWelcome welcome;
+    if (!WaitForHostMessage(gc, k_EMsgGCClientWelcome, event)
+        || !ParseHostProtobuf(event, welcome))
+    {
+        return false;
+    }
+
+    // LauncherStateWire is intentionally a fixed 10-u32 additive bridge shape.
+    const std::array<uint32_t, 10> state{
+        7, 0, 3, 250, 1, 21, 2, 4, 1, 18,
+    };
+    gc.PostToGC(GCEvent::LauncherBridgeMessage,
+        static_cast<uint16_t>(LauncherBridge::MessageType::State),
+        state.data(), static_cast<uint32_t>(sizeof(state)));
+
+    std::vector<EventData> events;
+    if (!WaitForHostMessagesUntil(gc,
+            k_EMsgGCCStrike15_v2_MatchmakingGC2ClientUpdate, events))
+    {
+        return false;
+    }
+
+    bool foundPersona = false;
+    bool foundAccount = false;
+    bool foundMatchmakingHello = false;
+    bool foundRankUpdate = false;
+    bool foundMatchmakingUpdate = false;
+    for (const EventData &candidate : events)
+    {
+        const uint32_t type = static_cast<uint32_t>(candidate.id) & ~ProtobufMask;
+        if (type == k_ESOMsg_Create || type == k_ESOMsg_Update)
+        {
+            CMsgSOSingleObject object;
+            if (!ParseHostProtobuf(candidate, object))
+            {
+                return false;
+            }
+            if (object.type_id() == SOTypePersonaDataPublic)
+            {
+                CSOPersonaDataPublic persona;
+                foundPersona = persona.ParseFromString(object.object_data())
+                    && persona.player_level() == 3
+                    && persona.elevated_state();
+            }
+            else if (object.type_id() == SOTypeGameAccountClient)
+            {
+                CSOEconGameAccountClient account;
+                foundAccount = account.ParseFromString(object.object_data())
+                    && account.elevated_state() == ElevatedStatePrime;
+            }
+        }
+        else if (type == k_EMsgGCCStrike15_v2_MatchmakingGC2ClientHello)
+        {
+            CMsgGCCStrike15_v2_MatchmakingGC2ClientHello profile;
+            foundMatchmakingHello = ParseHostProtobuf(candidate, profile)
+                && profile.player_level() == 3
+                && profile.player_cur_xp() == 250
+                && profile.has_ranking()
+                && profile.ranking().rank_id() == 7
+                && profile.ranking().wins() == 0;
+        }
+        else if (type == k_EMsgGCCStrike15_v2_ClientGCRankUpdate)
+        {
+            CMsgGCCStrike15_v2_ClientGCRankUpdate update;
+            if (!ParseHostProtobuf(candidate, update))
+            {
+                return false;
+            }
+            for (const PlayerRankingInfo &rank : update.rankings())
+            {
+                foundRankUpdate |= rank.rank_type_id() == RankTypeCompetitive
+                    && rank.rank_id() == 7 && rank.wins() == 0;
+            }
+        }
+        else if (type == k_EMsgGCCStrike15_v2_MatchmakingGC2ClientUpdate)
+        {
+            CMsgGCCStrike15_v2_MatchmakingGC2ClientUpdate update;
+            foundMatchmakingUpdate = ParseHostProtobuf(candidate, update)
+                && update.matchmaking() == 1
+                && update.global_stats().players_online() == 21
+                && update.global_stats().players_searching() == 4;
+        }
+    }
+
+    CMsgSOCacheSubscriptionRefresh refresh;
+    refresh.mutable_owner_soid()->set_type(SoIdTypeSteamId);
+    refresh.mutable_owner_soid()->set_id(SteamId);
+    SendGCProtobuf(gc, k_ESOMsg_CacheSubscriptionRefresh, refresh);
+    event = {};
+    CMsgSOCacheSubscribed subscription;
+    bool snapshotPersona = false;
+    bool snapshotAccount = false;
+    if (!WaitForHostMessage(gc, k_ESOMsg_CacheSubscribed, event)
+        || !ParseHostProtobuf(event, subscription))
+    {
+        return false;
+    }
+    for (const CMsgSOCacheSubscribed_SubscribedType &objects : subscription.objects())
+    {
+        if (objects.type_id() == SOTypePersonaDataPublic && objects.object_data_size() == 1)
+        {
+            CSOPersonaDataPublic persona;
+            snapshotPersona = persona.ParseFromString(objects.object_data(0))
+                && persona.player_level() == 3 && persona.elevated_state();
+        }
+        else if (objects.type_id() == SOTypeGameAccountClient
+            && objects.object_data_size() == 1)
+        {
+            CSOEconGameAccountClient account;
+            snapshotAccount = account.ParseFromString(objects.object_data(0))
+                && account.elevated_state() == ElevatedStatePrime;
+        }
+    }
+
+    return foundPersona && foundAccount && foundMatchmakingHello
+        && foundRankUpdate && foundMatchmakingUpdate
+        && snapshotPersona && snapshotAccount;
+}
+
+static bool QueuePresentationAcknowledgesGoAndIgnoresSupersededReplies()
+{
+    QueuePresentation state;
+    const auto join = state.Start(0);
+    if (!join || state.Phase(0) != 1 || state.Start(0) != 0) return false;
+    // Bootstrap sampled before GO cannot reset the immediate searching state.
+    if (state.Phase(4) != 1) return false;
+    const auto cancel = state.Stop();
+    if (!cancel || cancel == join || state.Phase(1) != 0 || !state.Cancelling()) return false;
+    if (state.Reply(join, "") || state.Phase(4) != 0 || state.Stop() != 0 || state.Start(0)) return false;
+    if (!state.Reply(cancel, "") || state.Cancelling() || state.Phase(0) != 0) return false;
+    if (state.Start(1) || state.Start(2) || state.Start(3)) return false;
+    const auto rejoin = state.Start(4); // Assigned DM can be explicitly rejoined.
+    if (!rejoin || !state.Reply(rejoin, "Server unavailable. Try again.")) return false;
+    if (state.Phase(4) != 0 || state.Error().empty()) return false;
+    const auto retry = state.Start(0);
+    if (!retry || !state.Error().empty() || state.Phase(0) != 1) return false;
+    state.ConnectionChanged(false);
+    if (state.Reply(retry, "") || state.Error().empty() || state.Phase(1) != 0) return false;
+    state.ConnectionChanged(true);
+    return state.Error().empty() && state.Phase(1) == 1;
+}
+
+static bool AssignedMatchStopsNativeSearchAndIgnoresUnsolicitedQueueReplies()
+{
+    ClientGC gc{ 76561197960265729ull };
+    const std::array<uint32_t, 10> state{7, 0, 3, 250, 4, 21, 2, 4, 1, 18};
+    gc.PostToGC(GCEvent::LauncherBridgeMessage,
+        static_cast<uint16_t>(LauncherBridge::MessageType::State), state.data(), sizeof(state));
+    EventData event;
+    CMsgGCCStrike15_v2_MatchmakingGC2ClientUpdate update;
+    if (!WaitForHostMessage(gc, k_EMsgGCCStrike15_v2_MatchmakingGC2ClientUpdate, event)
+        || !ParseHostProtobuf(event, update) || update.matchmaking() != 0
+        || update.ongoingmatch_account_id_sessions_size() != 1) return false;
+    LauncherBridge::QueueCommandResultWire reply{123, 1};
+    gc.PostToGC(GCEvent::LauncherBridgeMessage,
+        static_cast<uint16_t>(LauncherBridge::MessageType::QueueCommandResult), &reply, sizeof(reply));
+    // A second authoritative update is also a deterministic GC event barrier.
+    gc.PostToGC(GCEvent::LauncherBridgeMessage,
+        static_cast<uint16_t>(LauncherBridge::MessageType::State), state.data(), sizeof(state));
+    event = {};
+    return WaitForHostMessage(gc, k_EMsgGCCStrike15_v2_MatchmakingGC2ClientUpdate, event)
+        && ParseHostProtobuf(event, update) && update.matchmaking() == 0;
+}
+
+static bool NativeReadyCheckBridgeAcceptsOnlyBoundedState()
+{
+    constexpr uint64_t SteamId = 76561197960265729ull;
+    ClientGC gc{ SteamId };
+    LauncherBridge::ReadyCheckWire wire{};
+    wire.visible = 1;
+    wire.localAccepted = 0;
+    wire.acceptedPlayers = 4;
+    wire.totalPlayers = 10;
+    wire.secondsRemaining = 19;
+    constexpr char MatchId[] = "11111111-2222-3333-4444-555555555555";
+    constexpr char Map[] = "de_mirage";
+    std::memcpy(wire.matchId, MatchId, sizeof(wire.matchId));
+    std::memcpy(wire.map, Map, sizeof(Map));
+
+    gc.PostToGC(GCEvent::LauncherBridgeMessage,
+        static_cast<uint16_t>(LauncherBridge::MessageType::ReadyCheck),
+        &wire, sizeof(wire));
+
+    std::vector<EventData> events;
+    EventData readyEvent;
+    bool received = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{ 1 };
+    while (!received && std::chrono::steady_clock::now() < deadline)
+    {
+        gc.GetHostEvents(events);
+        for (EventData &event : events)
+        {
+            if (event.type == static_cast<int>(HostEvent::NativeReadyCheck))
+            {
+                readyEvent = std::move(event);
+                received = true;
+                break;
+            }
+        }
+        events.clear();
+        if (!received)
+        {
+            std::this_thread::yield();
+        }
+    }
+    if (!received || readyEvent.buffer.size() != sizeof(wire)
+        || std::memcmp(readyEvent.buffer.data(), &wire, sizeof(wire)) != 0)
+    {
+        return false;
+    }
+
+    // Native non-competitive @map announcement has no invented acceptance count.
+    wire.announcementOnly = 1;
+    wire.localAccepted = 1;
+    wire.acceptedPlayers = 0;
+    wire.totalPlayers = 0;
+    wire.secondsRemaining = 0;
+    memset(wire.map, 0, sizeof(wire.map));
+    memcpy(wire.map, "de_dust2", sizeof("de_dust2"));
+    gc.PostToGC(GCEvent::LauncherBridgeMessage,
+        static_cast<uint16_t>(LauncherBridge::MessageType::ReadyCheck), &wire, sizeof(wire));
+    // Follow with a normal GC request to drain all preceding host events.
+    CMsgClientHello hello;
+    SendGCProtobuf(gc, k_EMsgGCClientHello, hello);
+    if (!WaitForHostMessagesUntil(gc, k_EMsgGCClientWelcome, events, true)) return false;
+    if (std::none_of(events.begin(), events.end(), [&wire](const EventData &event) {
+        return event.type == static_cast<int>(HostEvent::NativeReadyCheck)
+            && event.buffer.size() == sizeof(wire)
+            && memcmp(event.buffer.data(), &wire, sizeof(wire)) == 0;
+    })) return false;
+    events.clear();
+
+    wire.totalPlayers = 10; // Invalid fabricated slots must not reach Panorama.
+    gc.PostToGC(GCEvent::LauncherBridgeMessage,
+        static_cast<uint16_t>(LauncherBridge::MessageType::ReadyCheck), &wire, sizeof(wire));
+    wire.totalPlayers = 0;
+
+    wire.matchId[8] = '0';
+    gc.PostToGC(GCEvent::LauncherBridgeMessage,
+        static_cast<uint16_t>(LauncherBridge::MessageType::ReadyCheck),
+        &wire, sizeof(wire));
+    const auto invalidDeadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds{ 100 };
+    while (std::chrono::steady_clock::now() < invalidDeadline)
+    {
+        gc.GetHostEvents(events);
+        if (std::any_of(events.begin(), events.end(), [](const EventData &event) {
+                return event.type == static_cast<int>(HostEvent::NativeReadyCheck);
+            }))
+        {
+            return false;
+        }
+        events.clear();
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+int main()
+{
+    struct TestCase
+    {
+        const char *name;
+        bool (*run)();
+    };
+
+    const TestCase tests[]{
+        { "QueuePresentationAcknowledgesGoAndIgnoresSupersededReplies",
+            QueuePresentationAcknowledgesGoAndIgnoresSupersededReplies },
+        { "AssignedMatchStopsNativeSearchAndIgnoresUnsolicitedQueueReplies",
+            AssignedMatchStopsNativeSearchAndIgnoresUnsolicitedQueueReplies },
+        { "ExtendedCraftResponseSerialization", ExtendedCraftResponseSerialization },
+        { "TruncatedCraftRequestGetsInvalidResponse", TruncatedCraftRequestGetsInvalidResponse },
+        { "BasicStructHeaderSerializationIsUnchanged", BasicStructHeaderSerializationIsUnchanged },
+        { "OwnedOnlyPolicyAllowsAuthoritativeInventoryStructMessages",
+            OwnedOnlyPolicyAllowsAuthoritativeInventoryStructMessages },
+        { "NetworkingClientRefreshesInterfacesAndSkipsIdlePolling",
+            NetworkingClientRefreshesInterfacesAndSkipsIdlePolling },
+        { "ServerLoadoutRequestsArePeerBoundAndDoNotResetLocalInventory",
+            ServerLoadoutRequestsArePeerBoundAndDoNotResetLocalInventory },
+        { "PlayerProfileRequestsReturnMinimalProfiles",
+            PlayerProfileRequestsReturnMinimalProfiles },
+        { "LauncherProfilesPublishAuthoritativePartyState",
+            LauncherProfilesPublishAuthoritativePartyState },
+        { "LauncherStatePublishesAuthoritativeLocalProfile",
+            LauncherStatePublishesAuthoritativeLocalProfile },
+        { "InventoryPersistenceProtectsFiles", InventoryPersistenceProtectsFiles },
+        { "StatsSubscriptionDuplicatesKeepNewest", StatsSubscriptionDuplicatesKeepNewest },
+        { "LoadoutStateTransitionsPreserveClassesAndSwapSlots",
+            LoadoutStateTransitionsPreserveClassesAndSwapSlots },
+        { "SOCacheVersionNegotiationAndRefresh", SOCacheVersionNegotiationAndRefresh },
+        { "BaseItemCustomizationsPreserveRemainingState",
+            BaseItemCustomizationsPreserveRemainingState },
+        { "StatTrakSwapToolTwoPackCreatesTwoTools", StatTrakSwapToolTwoPackCreatesTwoTools },
+        { "UnusualStatTrakKnivesCanSwapCounters", UnusualStatTrakKnivesCanSwapCounters },
+        { "StorePurchasesFinalizeTransactionally", StorePurchasesFinalizeTransactionally },
+        { "StatsSubscriptionPurchasesRejectDuplicates",
+            StatsSubscriptionPurchasesRejectDuplicates },
+        { "ServiceMedalsFollowBuildYearAndPersistPrestige",
+            ServiceMedalsFollowBuildYearAndPersistPrestige },
+        { "ViewerPassActivationCreatesAndPersistsJournal",
+            ViewerPassActivationCreatesAndPersistsJournal },
+        { "ViewerPassTokenPacksUpdatePersistedJournal",
+            ViewerPassTokenPacksUpdatePersistedJournal },
+        { "SouvenirTokenInitializesMissingPurchasedCount",
+            SouvenirTokenInitializesMissingPurchasedCount },
+        { "EventFavoritesPersistAndPreserveRequestJobs",
+            EventFavoritesPersistAndPreserveRequestJobs },
+        { "OwnedInventoryRequiresExactImmutableItems",
+            OwnedInventoryRequiresExactImmutableItems },
+        { "NativeReadyCheckBridgeAcceptsOnlyBoundedState",
+            NativeReadyCheckBridgeAcceptsOnlyBoundedState },
+    };
+
+    bool allPassed = true;
+    for (const TestCase &test : tests)
+    {
+        const bool passed = test.run();
+        std::printf("%s: %s\n", test.name, passed ? "PASS" : "FAIL");
+        allPassed &= passed;
+    }
+
+    return allPassed ? 0 : 1;
+}

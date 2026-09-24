@@ -1,0 +1,126 @@
+name: Release unsigned launcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Launcher semantic version (must match apps/launcher/Cargo.toml)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unsigned-launcher-release
+  cancel-in-progress: false
+
+jobs:
+  build-verify-release:
+    name: Build, verify, and publish unsigned launcher
+    runs-on: windows-2025
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out immutable source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.93.1 --profile minimal --no-self-update
+          rustup default 1.93.1
+
+      - name: Validate release version
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$') {
+            throw 'version must use major.minor.patch.'
+          }
+          $manifest = Get-Content -Raw -LiteralPath .\apps\launcher\Cargo.toml
+          $versionMatch = [regex]::Match($manifest, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"\s*$')
+          if (-not $versionMatch.Success) {
+            throw 'Could not read the launcher package version.'
+          }
+          $packageVersion = $versionMatch.Groups['version'].Value
+          if ($packageVersion -ne $env:RELEASE_VERSION) {
+            throw "Release version $env:RELEASE_VERSION does not match launcher version $packageVersion."
+          }
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install interface dependencies
+        run: npm ci
+
+      - name: Test launcher
+        run: npm run launcher:test
+
+      - name: Build launcher
+        shell: pwsh
+        run: .\scripts\build-launcher.ps1
+
+      - name: Verify unsigned install and protocol registration
+        shell: pwsh
+        run: |
+          $launcher = (Resolve-Path .\.artifacts\launcher\b2g-launcher.exe).Path
+          $signature = Get-AuthenticodeSignature -LiteralPath $launcher
+          if ($signature.Status -ne 'NotSigned') {
+            throw "Expected an unsigned launcher, but Authenticode status is $($signature.Status)."
+          }
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'b2g-unsigned-install'
+          & $launcher install
+          if ($LASTEXITCODE -ne 0) { throw 'Unsigned launcher installation failed.' }
+          $installed = Join-Path $env:LOCALAPPDATA 'B2G\bin\b2g-launcher.exe'
+          if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) {
+            throw 'The per-user launcher executable was not installed.'
+          }
+          $registered = (Get-Item -LiteralPath Registry::HKEY_CURRENT_USER\Software\Classes\b2g\shell\open\command).GetValue('')
+          $expected = '"' + $installed + '" protocol "%1"'
+          if ($registered -ne $expected) {
+            throw "Unexpected b2g:// protocol command: $registered"
+          }
+
+      - name: Package release assets
+        id: package
+        shell: pwsh
+        run: |
+          $source = '.\.artifacts\launcher\b2g-launcher.exe'
+          $asset = '.\.artifacts\launcher\b2g-launcher-windows-x86_64.exe'
+          Copy-Item -LiteralPath $source -Destination $asset -Force
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$asset.sha256" -Value "$hash  b2g-launcher-windows-x86_64.exe" -Encoding ascii
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "sha256=$hash"
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_SHA256: ${{ steps.package.outputs.sha256 }}
+        run: |
+          $tag = "launcher-v$env:RELEASE_VERSION"
+          $notes = @(
+            'Windows x86-64 unsigned alpha launcher for B2G.',
+            '',
+            'Download and run the executable once. Windows may show **Unknown publisher**; choose **More info**, then **Run anyway**. The launcher installs for the current user and registers b2g:// without administrator access.',
+            '',
+            'Automatic updates are disabled for unsigned builds. Download future versions manually from this repository.',
+            '',
+            "SHA-256: $env:RELEASE_SHA256"
+          ) -join [Environment]::NewLine
+          gh release create $tag `
+            .\.artifacts\launcher\b2g-launcher-windows-x86_64.exe `
+            .\.artifacts\launcher\b2g-launcher-windows-x86_64.exe.sha256 `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title "B2G Launcher $env:RELEASE_VERSION (unsigned alpha)" `
+            --notes $notes `
+            --prerelease

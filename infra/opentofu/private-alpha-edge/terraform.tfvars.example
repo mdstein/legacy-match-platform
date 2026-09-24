@@ -1,0 +1,20 @@
+cloudflare_account_id = "0123456789abcdef0123456789abcdef"
+cloudflare_zone_id    = "abcdef0123456789abcdef0123456789"
+domain                = "example.com"
+game_origin_ipv4      = "198.51.100.20"
+demo_bucket_name      = "legacy-match-private-alpha-demos"
+tunnel_name           = "legacy-match-private-alpha"
+
+# Keep the two hosts in the same selected OVH full region.
+# Vint Hill:
+app_subdomain  = "play"
+game_subdomain = "game-na-east"
+route_label    = "NA East"
+
+# Hillsboro alternative:
+# game_subdomain = "game-na-west"
+# route_label    = "NA West"
+
+game_port = 27115
+latency_probe_port = 27125
+gotv_port  = 27120

@@ -1,0 +1,53 @@
+[package]
+name = "b2g-launcher"
+version = "0.2.41"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Native Windows launcher and in-game matchmaking bridge for B2G"
+
+[dependencies]
+base64 = "0.22"
+hmac = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+png = { version = "0.18.1", default-features = false }
+sha2 = "0.10"
+time = { version = "0.3", features = ["parsing"] }
+url = "2"
+ureq = { version = "3.4", default-features = false, features = ["native-tls"] }
+
+[target.'cfg(windows)'.dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Security",
+  "Win32_Security_Credentials",
+  "Win32_Storage_FileSystem",
+  "Win32_Storage_Xps",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_DataExchange",
+  "Win32_System_Com",
+  "Win32_System_Console",
+  "Win32_System_Memory",
+  "Win32_System_IO",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Pipes",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Controls",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

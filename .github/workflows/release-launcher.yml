@@ -1,0 +1,165 @@
+name: Release signed launcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Launcher semantic version (must match apps/launcher/Cargo.toml)
+        required: true
+        type: string
+      download_url:
+        description: Final credential-free HTTPS URL for b2g-launcher.exe
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production-launcher-signing
+  cancel-in-progress: false
+
+jobs:
+  build-sign-verify:
+    name: Build, sign, and verify launcher
+    runs-on: windows-2025
+    timeout-minutes: 30
+    environment: production-signing
+
+    steps:
+      - name: Check out immutable source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.93.1 --profile minimal --no-self-update
+          rustup default 1.93.1
+
+      - name: Validate release inputs and signing configuration
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_DOWNLOAD_URL: ${{ inputs.download_url }}
+          SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          SIGNING_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+        run: |
+          if ($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$') {
+            throw 'version must use major.minor.patch.'
+          }
+          $download = [uri]$env:RELEASE_DOWNLOAD_URL
+          if (-not $download.IsAbsoluteUri -or $download.Scheme -ne 'https' -or -not $download.Host) {
+            throw 'download_url must be an absolute credential-free HTTPS URL.'
+          }
+          if ($download.UserInfo) { throw 'download_url must not contain credentials.' }
+          foreach ($value in @($env:SIGNING_ENDPOINT, $env:SIGNING_ACCOUNT, $env:SIGNING_PROFILE)) {
+            if ([string]::IsNullOrWhiteSpace($value)) { throw 'Artifact Signing environment variables are incomplete.' }
+          }
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install interface dependencies
+        run: npm ci
+
+      - name: Test launcher
+        run: npm run launcher:test
+
+      - name: Build unsigned identity probe
+        shell: pwsh
+        run: .\scripts\build-launcher.ps1
+
+      - name: Authenticate to Azure with GitHub OIDC
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign identity probe with Azure Artifact Signing
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: ${{ github.workspace }}\.artifacts\launcher\b2g-launcher.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: B2G Launcher
+
+      - name: Read durable publisher identity
+        id: publisher
+        shell: pwsh
+        run: |
+          $identity = .\scripts\get-artifact-signing-identity.ps1 -File .\.artifacts\launcher\b2g-launcher.exe
+          if ($identity -notmatch '^1\.3\.6\.1\.4\.1\.311\.97\.(?!1\.0$)[0-9]+(?:\.[0-9]+)+$') {
+            throw 'The signed probe did not expose a valid durable Artifact Signing identity.'
+          }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "publisher_identity_eku=$identity"
+
+      - name: Rebuild launcher with durable publisher identity pin
+        shell: pwsh
+        env:
+          PUBLISHER_IDENTITY_EKU: ${{ steps.publisher.outputs.publisher_identity_eku }}
+        run: .\scripts\build-launcher.ps1 -PublisherIdentityEku $env:PUBLISHER_IDENTITY_EKU
+
+      - name: Sign release launcher with Azure Artifact Signing
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: ${{ github.workspace }}\.artifacts\launcher\b2g-launcher.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: B2G Launcher
+
+      - name: Create and independently verify release contract
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_DOWNLOAD_URL: ${{ inputs.download_url }}
+          PUBLISHER_IDENTITY_EKU: ${{ steps.publisher.outputs.publisher_identity_eku }}
+        run: |
+          .\scripts\create-launcher-release.ps1 `
+            -Version $env:RELEASE_VERSION `
+            -DownloadUrl $env:RELEASE_DOWNLOAD_URL `
+            -PublisherIdentityEku $env:PUBLISHER_IDENTITY_EKU
+          $launcher = '.\.artifacts\launcher\b2g-launcher.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $launcher).Hash
+          & $launcher verify-update `
+            --file $launcher `
+            --sha256 $hash `
+            --publisher-identity-eku $env:PUBLISHER_IDENTITY_EKU
+          if ($LASTEXITCODE -ne 0) { throw 'The signed release failed launcher-native verification.' }
+          $wrongIdentity = '1.3.6.1.4.1.311.97.999999999.999999999.999999999.999999999'
+          $previousPreference = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          & $launcher verify-update `
+            --file $launcher `
+            --sha256 $hash `
+            --publisher-identity-eku $wrongIdentity 2>$null
+          $wrongIdentityExitCode = $LASTEXITCODE
+          $ErrorActionPreference = $previousPreference
+          if ($wrongIdentityExitCode -eq 0) { throw 'The launcher accepted an incorrect publisher identity.' }
+          $global:LASTEXITCODE = 0
+
+      - name: Upload signed release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: b2g-launcher-${{ inputs.version }}-signed
+          path: |
+            .artifacts/launcher/b2g-launcher.exe
+            .artifacts/launcher/update-manifest.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30

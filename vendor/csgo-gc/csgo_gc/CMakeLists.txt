@@ -1,0 +1,310 @@
+project(csgo_gc)
+
+find_package(MbedTLS CONFIG REQUIRED)
+find_package(Protobuf CONFIG REQUIRED)
+
+# Funchook and its dependencies are pulled in via FetchContent. Consider a
+# maintained alternative if reliable x86_64 macOS hooking becomes necessary.
+include(FetchContent)
+set(FETCHCONTENT_QUIET FALSE)
+
+option(FUNCHOOK_BUILD_SHARED "build shared library" OFF)
+option(FUNCHOOK_BUILD_TESTS "Build tests" OFF)
+option(FUNCHOOK_INSTALL "Install Funchook" OFF)
+
+FetchContent_Declare(funchook
+	GIT_REPOSITORY https://github.com/kubo/funchook
+	GIT_TAG v1.1.3
+	GIT_SHALLOW TRUE)
+
+FetchContent_MakeAvailable(funchook)
+
+add_library(csgo_gc SHARED
+    appid.cpp
+    case_opening.cpp
+    config.cpp
+    gc_client.cpp
+    gc_message.cpp
+    gc_server.cpp
+    gc_shared.cpp
+    graffiti.cpp
+    inventory.cpp
+    item_schema.cpp
+    item_utils.cpp
+    keyvalue.cpp
+    launcher_bridge.cpp
+    main.cpp
+    networking_client.cpp
+    networking_server.cpp
+    owned_inventory.cpp
+    panorama_patch.cpp
+    rcon_server.cpp
+    saved_item_shuffles.cpp
+    souvenir.cpp
+    steam_hook.cpp)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    target_sources(csgo_gc PRIVATE platform_windows.cpp)
+else()
+    target_sources(csgo_gc PRIVATE platform_unix.cpp)
+endif()
+
+target_precompile_headers(csgo_gc PRIVATE stdafx.h)
+
+set_target_properties(csgo_gc PROPERTIES PREFIX "")
+
+if (MSVC)
+    target_compile_options(csgo_gc PRIVATE /W4 /wd4244 /wd4819 /Zc:preprocessor)
+    target_compile_definitions(csgo_gc PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(csgo_gc PRIVATE -Wall -Wextra)
+endif()
+
+set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../protobufs)
+file(GLOB PROTOS CONFIGURE_DEPENDS ${PROTO_DIR}/*.proto)
+set(PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+
+file(MAKE_DIRECTORY ${PROTOC_OUT_DIR})
+
+add_library(csgo_gc_protobufs STATIC)
+set_target_properties(csgo_gc_protobufs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+protobuf_generate(
+    TARGET csgo_gc_protobufs
+    PROTOS ${PROTOS}
+    IMPORT_DIRS ${PROTO_DIR}
+    PROTOC_OUT_DIR ${PROTOC_OUT_DIR})
+
+source_group("Protobufs" REGULAR_EXPRESSION "\\.pb\\.(cc|h)$")
+
+target_include_directories(csgo_gc_protobufs PUBLIC ${PROTOC_OUT_DIR})
+target_link_libraries(csgo_gc_protobufs PUBLIC protobuf::libprotobuf-lite)
+
+target_link_libraries(csgo_gc PRIVATE
+    MbedTLS::mbedcrypto
+    csgo_gc_protobufs
+    funchook-static
+    steam_api
+    Threads::Threads)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    target_link_libraries(csgo_gc PRIVATE ws2_32)
+endif()
+
+# apple message box
+if (APPLE)
+    target_link_libraries(csgo_gc PRIVATE "-framework Foundation")
+endif()
+
+if (OUTDIR)
+    add_custom_command(TARGET csgo_gc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+        $<TARGET_FILE:csgo_gc>
+        ${OUTDIR}/csgo_gc/${GC_LIB_DIR}/$<TARGET_FILE_NAME:csgo_gc>)
+endif()
+
+if (BUILD_TESTING)
+    add_executable(gc_message_tests
+        appid.cpp
+        case_opening.cpp
+        config.cpp
+        gc_client.cpp
+        gc_shared.cpp
+        graffiti.cpp
+        gc_message_tests.cpp
+        gc_message.cpp
+        inventory.cpp
+        item_schema.cpp
+        item_utils.cpp
+        keyvalue.cpp
+        launcher_bridge.cpp
+        networking_client.cpp
+        owned_inventory.cpp
+        steam_hook_test_stub.cpp
+        souvenir.cpp)
+
+    target_precompile_headers(gc_message_tests PRIVATE stdafx.h)
+    target_link_libraries(gc_message_tests PRIVATE
+        MbedTLS::mbedcrypto
+        csgo_gc_protobufs
+        steam_api
+        Threads::Threads)
+
+    if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+        target_link_libraries(gc_message_tests PRIVATE ws2_32)
+    endif()
+
+    if (MSVC)
+        target_compile_options(gc_message_tests PRIVATE /W4 /wd4244 /wd4819)
+        target_compile_definitions(gc_message_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        target_compile_options(gc_message_tests PRIVATE -Wall -Wextra)
+    endif()
+
+    add_test(NAME gc_message_tests COMMAND gc_message_tests)
+
+    add_executable(owned_loadout_tests
+        appid.cpp
+        case_opening.cpp
+        config.cpp
+        gc_client.cpp
+        gc_server.cpp
+        gc_shared.cpp
+        graffiti.cpp
+        gc_message.cpp
+        inventory.cpp
+        item_schema.cpp
+        item_utils.cpp
+        keyvalue.cpp
+        launcher_bridge.cpp
+        networking_client.cpp
+        owned_inventory.cpp
+        owned_loadout_tests.cpp
+        networking_server.cpp
+        steam_hook_test_stub.cpp
+        souvenir.cpp)
+
+    target_precompile_headers(owned_loadout_tests PRIVATE stdafx.h)
+    target_compile_definitions(owned_loadout_tests PRIVATE B2G_LAUNCHER_BRIDGE_TESTING)
+    target_link_libraries(owned_loadout_tests PRIVATE
+        MbedTLS::mbedcrypto
+        csgo_gc_protobufs
+        steam_api
+        Threads::Threads)
+
+    if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+        target_link_libraries(owned_loadout_tests PRIVATE ws2_32)
+    endif()
+
+    if (MSVC)
+        target_compile_options(owned_loadout_tests PRIVATE /W4 /wd4244 /wd4819)
+        target_compile_definitions(owned_loadout_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        target_compile_options(owned_loadout_tests PRIVATE -Wall -Wextra)
+    endif()
+
+    set(OWNED_LOADOUT_TEST_WORKING_DIRECTORY
+        "${CMAKE_CURRENT_BINARY_DIR}/owned_loadout_test_workdir")
+    file(MAKE_DIRECTORY "${OWNED_LOADOUT_TEST_WORKING_DIRECTORY}")
+    add_test(NAME owned_loadout_tests COMMAND owned_loadout_tests)
+    set_tests_properties(owned_loadout_tests PROPERTIES
+        WORKING_DIRECTORY "${OWNED_LOADOUT_TEST_WORKING_DIRECTORY}")
+
+    add_executable(item_schema_tests
+        item_schema_tests.cpp
+        item_schema.cpp
+        keyvalue.cpp)
+
+    target_precompile_headers(item_schema_tests PRIVATE stdafx.h)
+    target_link_libraries(item_schema_tests PRIVATE csgo_gc_protobufs)
+
+    if (MSVC)
+        target_compile_options(item_schema_tests PRIVATE /W4 /wd4244 /wd4819)
+        target_compile_definitions(item_schema_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        target_compile_options(item_schema_tests PRIVATE -Wall -Wextra)
+    endif()
+
+    add_test(NAME item_schema_tests COMMAND item_schema_tests)
+
+    add_executable(souvenir_tests
+        config.cpp
+        item_schema.cpp
+        keyvalue.cpp
+        souvenir.cpp
+        souvenir_tests.cpp)
+
+    target_precompile_headers(souvenir_tests PRIVATE stdafx.h)
+    target_link_libraries(souvenir_tests PRIVATE csgo_gc_protobufs)
+
+    if (MSVC)
+        target_compile_options(souvenir_tests PRIVATE /W4 /wd4244 /wd4819)
+        target_compile_definitions(souvenir_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        target_compile_options(souvenir_tests PRIVATE -Wall -Wextra)
+    endif()
+
+    add_test(NAME souvenir_tests COMMAND souvenir_tests)
+
+    add_executable(keyvalue_tests
+        keyvalue_tests.cpp
+        keyvalue.cpp)
+
+    target_precompile_headers(keyvalue_tests PRIVATE stdafx.h)
+    target_link_libraries(keyvalue_tests PRIVATE csgo_gc_protobufs)
+
+    if (MSVC)
+        target_compile_options(keyvalue_tests PRIVATE /W4 /wd4244 /wd4819)
+        target_compile_definitions(keyvalue_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        target_compile_options(keyvalue_tests PRIVATE -Wall -Wextra)
+    endif()
+
+    add_test(NAME keyvalue_tests COMMAND keyvalue_tests)
+
+    add_executable(rcon_server_tests
+        config.cpp
+        keyvalue.cpp
+        rcon_server.cpp
+        rcon_server_tests.cpp)
+
+    target_precompile_headers(rcon_server_tests PRIVATE stdafx.h)
+    target_link_libraries(rcon_server_tests PRIVATE
+        csgo_gc_protobufs
+        Threads::Threads)
+
+    if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+        target_link_libraries(rcon_server_tests PRIVATE ws2_32)
+    endif()
+
+    if (MSVC)
+        target_compile_options(rcon_server_tests PRIVATE /W4 /wd4244 /wd4819)
+        target_compile_definitions(rcon_server_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        target_compile_options(rcon_server_tests PRIVATE -Wall -Wextra)
+    endif()
+
+    set(RCON_SERVER_TEST_WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/rcon_server_test_workdir")
+    file(MAKE_DIRECTORY "${RCON_SERVER_TEST_WORKING_DIRECTORY}")
+    add_test(NAME rcon_server_tests COMMAND rcon_server_tests)
+    set_tests_properties(rcon_server_tests PROPERTIES
+        WORKING_DIRECTORY "${RCON_SERVER_TEST_WORKING_DIRECTORY}")
+
+    add_executable(saved_item_shuffles_tests
+        saved_item_shuffles.cpp
+        saved_item_shuffles_tests.cpp)
+
+    target_precompile_headers(saved_item_shuffles_tests PRIVATE stdafx.h)
+    target_link_libraries(saved_item_shuffles_tests PRIVATE
+        csgo_gc_protobufs
+        steam_api)
+
+    if (MSVC)
+        target_compile_options(saved_item_shuffles_tests PRIVATE /W4 /wd4244 /wd4819)
+        target_compile_definitions(saved_item_shuffles_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        target_compile_options(saved_item_shuffles_tests PRIVATE -Wall -Wextra)
+    endif()
+
+    set(SAVED_ITEM_SHUFFLES_TEST_WORKING_DIRECTORY
+        "${CMAKE_CURRENT_BINARY_DIR}/saved_item_shuffles_test_workdir")
+    file(MAKE_DIRECTORY
+        "${SAVED_ITEM_SHUFFLES_TEST_WORKING_DIRECTORY}/csgo_gc")
+    add_test(NAME saved_item_shuffles_tests COMMAND saved_item_shuffles_tests)
+    set_tests_properties(saved_item_shuffles_tests PROPERTIES
+        WORKING_DIRECTORY "${SAVED_ITEM_SHUFFLES_TEST_WORKING_DIRECTORY}")
+
+    add_executable(panorama_patch_tests
+        panorama_patch.cpp
+        panorama_patch_tests.cpp)
+
+    target_compile_definitions(panorama_patch_tests PRIVATE PANORAMA_PATCH_TESTING)
+
+    if (MSVC)
+        target_compile_options(panorama_patch_tests PRIVATE /W4 /wd4244 /wd4819)
+    else()
+        target_compile_options(panorama_patch_tests PRIVATE -Wall -Wextra)
+    endif()
+
+    add_test(NAME panorama_patch_tests COMMAND panorama_patch_tests)
+endif()

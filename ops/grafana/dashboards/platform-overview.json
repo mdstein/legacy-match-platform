@@ -1,0 +1,61 @@
+{
+  "annotations": { "list": [] },
+  "editable": false,
+  "panels": [
+    {
+      "type": "stat", "title": "Queue tickets", "id": 1,
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "aftertick_queue_tickets", "refId": "A" }]
+    },
+    {
+      "type": "stat", "title": "Active matches", "id": 2,
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "targets": [{ "expr": "aftertick_active_matches", "refId": "A" }]
+    },
+    {
+      "type": "stat", "title": "Healthy game nodes", "id": 3,
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "targets": [{ "expr": "aftertick_healthy_nodes", "refId": "A" }]
+    },
+    {
+      "type": "stat", "title": "Pending reports", "id": 4,
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "aftertick_pending_reports", "refId": "A" }]
+    },
+    {
+      "type": "timeseries", "title": "HTTP requests / second", "id": 5,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "targets": [{ "expr": "sum by (status) (rate(aftertick_http_requests_total[5m]))", "legendFormat": "{{status}}", "refId": "A" }]
+    },
+    {
+      "type": "timeseries", "title": "API latency percentiles", "id": 6,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(aftertick_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(aftertick_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(aftertick_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p99", "refId": "C" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Evidence integrity", "id": 7,
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 13 },
+      "targets": [
+        { "expr": "aftertick_invalid_demos", "legendFormat": "invalid demos", "refId": "A" },
+        { "expr": "aftertick_open_recovery_incidents", "legendFormat": "open match recoveries", "refId": "B" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Process uptime", "id": 8,
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 13 },
+      "targets": [{ "expr": "aftertick_process_uptime_seconds", "refId": "A" }]
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 41,
+  "tags": ["aftertick", "private-alpha"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "title": "Aftertick Platform Overview",
+  "uid": "aftertick-platform",
+  "version": 1
+}

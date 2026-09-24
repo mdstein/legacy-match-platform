@@ -1,0 +1,14 @@
+# Application tunnel unavailable
+
+Use this runbook when the public application is unreachable, `cloudflared` is unhealthy, or `cloudflared_tunnel_ha_connections` falls to zero. Existing game processes may continue locally, but node-agent events and results retry until the API route recovers; do not destroy or reassign leases merely because ingress is unavailable.
+
+1. Confirm scope from an external network with `npm run hosted:preflight` or direct `/health` and `/ready` requests. Record UTC time, response status, `CF-Ray` when present, and the affected hostname.
+2. SSH to the application host. Run `docker compose --env-file /etc/aftertick/release.env -f /opt/aftertick/current/compose.hosted.yml ps cloudflared web api`. Do not print the token file or inspect the connector command environment.
+3. Query `http://127.0.0.1:20241/ready` and the loopback metrics endpoint. A non-200 readiness response or zero `cloudflared_tunnel_ha_connections` means the connector has no usable edge connection.
+4. Read bounded recent logs with `docker compose --env-file /etc/aftertick/release.env -f /opt/aftertick/current/compose.hosted.yml logs --since 15m --no-color cloudflared`. The connector uses `--token-file`, so the credential is not present in its process arguments; still redact unexpected secrets before attaching logs.
+5. Check host DNS and outbound TCP/UDP 7844 to Cloudflare's documented tunnel endpoints. Do not open inbound TCP 80/443 as a workaround and do not expose loopback port 20241 on a public interface.
+6. Check the tunnel in Cloudflare Networking > Tunnels or the scoped API. Distinguish invalid-token/configuration failures from a host, provider-network, or Cloudflare incident.
+7. For a transient connector failure, restart only `cloudflared` and require its Docker health check plus public `/health` and `/ready` before closing the incident. Do not restart PostgreSQL, Redis, or an active SRCDS without separate evidence.
+8. If the connector token is invalid or suspected exposed, rotate it in Cloudflare, refresh protected OpenTofu state, and pipe `tofu output -raw cloudflared_tunnel_token` over SSH into `sudo /usr/local/bin/aftertick-install-tunnel-token`. Restart only `cloudflared`; never paste the token into chat, logs, a command argument, or Git.
+9. If ingress remains unavailable, follow `api-unavailable.md` for queue/allocation recovery and preserve node retry queues, leases, demos, and result events. Escalate through the configured paging receiver.
+10. After recovery, verify Steam login, session reload, independent visitor-IP rate-limit buckets, one signed regional latency submission, node heartbeat, and any delayed result settlement exactly once. Attach public probe evidence, tunnel metrics, relevant redacted logs, and the audit/recovery timeline to the incident.

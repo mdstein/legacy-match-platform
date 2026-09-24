@@ -1,0 +1,66 @@
+name: aftertick-deploy
+
+services:
+  migrate:
+    image: ${AFTERTICK_API_IMAGE:-aftertick-api:local}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: ${AFTERTICK_MIGRATION_ENV_FILE:-deploy/.env.migration.example}
+    command: ["node", "apps/api/dist/migrate.js"]
+    profiles: ["ops"]
+    restart: "no"
+
+  seed:
+    image: ${AFTERTICK_API_IMAGE:-aftertick-api:local}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: ${AFTERTICK_MIGRATION_ENV_FILE:-deploy/.env.migration.example}
+    command: ["node", "apps/api/dist/seed.js"]
+    profiles: ["ops"]
+    restart: "no"
+
+  retention:
+    image: ${AFTERTICK_API_IMAGE:-aftertick-api:local}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: ${AFTERTICK_DEPLOY_ENV_FILE:-deploy/.env.production.example}
+    command: ["node", "apps/api/dist/retention.js"]
+    profiles: ["ops"]
+    restart: "no"
+
+  api:
+    image: ${AFTERTICK_API_IMAGE:-aftertick-api:local}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: ${AFTERTICK_DEPLOY_ENV_FILE:-deploy/.env.production.example}
+    init: true
+    restart: unless-stopped
+    expose:
+      - "8787"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+
+  web:
+    image: ${AFTERTICK_WEB_IMAGE:-aftertick-web:local}
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${AFTERTICK_BIND_ADDRESS:-127.0.0.1}:${AFTERTICK_HTTP_PORT:-8080}:8080"
+    security_opt:
+      - no-new-privileges:true

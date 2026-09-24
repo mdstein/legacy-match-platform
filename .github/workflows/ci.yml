@@ -1,0 +1,238 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      DATABASE_URL: postgres://aftertick:aftertick-local-postgres@127.0.0.1:5432/aftertick
+      TEST_DATABASE_URL: postgres://aftertick:aftertick-local-postgres@127.0.0.1:5432/aftertick
+      REDIS_URL: redis://:aftertick-local-redis@127.0.0.1:6379/0
+      SESSION_SECRET: ci-only-aftertick-session-secret-not-for-production
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Use OpenTofu 1.12.5
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: 1.12.5
+          tofu_wrapper: false
+
+      - name: Use Go 1.27
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.x'
+          cache-dependency-path: services/demo-analyzer/go.sum
+
+      - name: Use Rust 1.93.1
+        run: |
+          rustup toolchain install 1.93.1 --profile minimal --no-self-update
+          rustup default 1.93.1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm run audit:production
+
+      - name: Validate observability configuration
+        run: docker compose -f compose.yml -f compose.observability.yml config --quiet
+
+      - name: Validate deployment configuration
+        run: docker compose -f compose.deploy.yml config --quiet
+
+      - name: Validate minimal hosted deployment configuration
+        run: npm run deploy:host:config
+
+      - name: Verify pinned outbound tunnel image
+        run: npm run test:cloudflared:image
+
+      - name: Validate private-alpha edge infrastructure
+        run: npm run infra:iac:validate
+
+      - name: Test hosted DNS/HTTP/A2S acceptance probe
+        run: npm run test:hosted:preflight
+
+      - name: Build and test the legacy demo analyzer
+        run: npm run demo:analyzer:test
+
+      - name: Start durable services
+        run: npm run infra:up
+
+      - name: Apply database migrations
+        run: npm run db:migrate
+
+      - name: Seed baseline data
+        run: npm run db:seed
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Run PostgreSQL integration tests
+        run: npm run test:integration:db
+
+      - name: Run native launcher latency integration
+        run: npm run test:integration:latency
+
+      - name: Verify backup retention safety and idempotency
+        run: npm run test:retention:backups
+
+      - name: Run Redis integration tests
+        run: npm run test:integration:redis
+
+      - name: Run Redis queue burst smoke
+        run: npm run test:load:queue
+
+      - name: Typecheck workspaces
+        run: npm run typecheck
+
+      - name: Build production artifacts
+        run: npm run build
+
+      - name: Exercise failed production deployment and exact-image rollback
+        run: npm run test:deployment:rollback
+
+      - name: Exercise immutable Linux release activation and rollback
+        run: npm run test:linux-host-release
+
+      - name: Upload deployment rollback evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deployment-rollback-evidence
+          path: .artifacts/deployment-rollback/latest.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Test built API with durable services
+        run: npm run test:integration:api
+
+      - name: Exercise API, Redis, and PostgreSQL outage recovery
+        run: npm run test:resilience
+
+      - name: Start metrics and tracing services
+        run: npm run infra:observability:up
+
+      - name: Verify metrics, alerts, stored traces, and Grafana datasources
+        run: npm run test:observability
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build browser end-to-end artifact
+        run: npm run build:e2e --workspace @aftertick/web
+
+      - name: Run browser end-to-end tests
+        run: node scripts/run-e2e.mjs
+
+      - name: Upload Playwright failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-evidence
+          path: .artifacts/playwright
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Capture service logs on failure
+        if: failure()
+        run: docker compose -f compose.yml -f compose.observability.yml logs --no-color
+
+      - name: Stop services
+        if: always()
+        run: docker compose -f compose.yml -f compose.observability.yml down --volumes --remove-orphans
+
+  launcher-windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Use Rust 1.93.1
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.93.1 --profile minimal --no-self-update
+          rustup default 1.93.1
+
+      - name: Build launcher interface
+        run: npm run build --workspace @aftertick/launcher-ui
+
+      - name: Install launcher browser test runtime
+        run: npx playwright install chromium
+
+      - name: Test launcher interactions and layouts
+        run: npm run test:ui --workspace @aftertick/launcher-ui
+
+      - name: Test Rust launcher
+        run: cargo test --locked --manifest-path apps/launcher/Cargo.toml
+
+      - name: Build Windows launcher
+        run: cargo build --release --locked --manifest-path apps/launcher/Cargo.toml
+
+      - name: Verify Authenticode identity-pinned update acceptance
+        shell: pwsh
+        run: .\scripts\test-launcher-signing.ps1
+
+      - name: Exercise native diagnosis and deep-link validation
+        shell: pwsh
+        run: |
+          & .\apps\launcher\target\release\b2g-launcher.exe doctor --json | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher diagnosis failed.' }
+          & .\apps\launcher\target\release\b2g-launcher.exe protocol 'b2g://connect?server=127.0.0.1%3A27115&password=aftertickCiPassword123' --dry-run | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher deep-link validation failed.' }
+
+      - name: Install pinned game-node compilation toolchain
+        shell: powershell
+        run: .\scripts\install-game-toolchain.ps1 -SkipServerDownload
+
+      - name: Build and verify secret-free host release bundles
+        shell: powershell
+        run: |
+          npm run game:node:release
+          npm run game:node:release:verify
+          npm run test:game-node:installer
+          npm run deploy:host:release
+          npm run deploy:host:release:verify
+
+      - name: Upload unsigned launcher candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: b2g-launcher-unsigned-windows
+          path: apps/launcher/target/release/b2g-launcher.exe
+          retention-days: 7
+
+      - name: Upload verified host release bundles
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aftertick-host-release-bundles
+          retention-days: 7
+          path: |
+            .artifacts/app-host/aftertick-app-host-*.zip
+            .artifacts/game-node/aftertick-game-node-*.zip

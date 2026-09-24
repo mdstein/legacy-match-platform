@@ -1,0 +1,26 @@
+"log_output" "2"
+"appid_override" "4465480"
+"show_csgo_gc_servers_only" "1"
+"b2g_owned_only" "1"
+"rcon"
+{
+    "enabled" "0"
+    "bind_address" "127.0.0.1"
+    "port" "37016"
+    "password" ""
+}
+"ranks"
+{
+    "competitive_rank" "0"
+    "competitive_wins" "0"
+    "wingman_rank" "0"
+    "wingman_wins" "0"
+    "dangerzone_rank" "0"
+    "dangerzone_wins" "0"
+}
+"vac_banned" "0"
+"cmd_friendly" "0"
+"cmd_teaching" "0"
+"cmd_leader" "0"
+"player_level" "0"
+"player_cur_xp" "0"

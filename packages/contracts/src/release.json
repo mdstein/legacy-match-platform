@@ -1,0 +1,299 @@
+{
+  "launcherVersion": "0.2.41",
+  "nodeVersion": "0.1.28",
+  "channel": "Founders Playtest",
+  "preparedAt": "2026-09-08T23:30:00.000Z",
+  "changelog": {
+    "title": "Your inventory, in the launcher",
+    "summary": "Browse your Steam skins and B2G items, check exact item details and refresh Steam inventory from the launcher. Supported knives and missing legacy finishes now import correctly."
+  },
+  "news": {
+    "title": "Welcome back to Counter-Strike.",
+    "summary": "A refined launcher with smooth hover effects, guided installation and account setup. Your matches, inventory and settings stay close at hand."
+  },
+  "history": [
+    {
+      "version": "0.2.41",
+      "date": "2026-09-08",
+      "changes": [
+        { "kind": "added", "text": "An Inventory tab with search, Steam/B2G filters, item details and Steam refresh." },
+        { "kind": "fixed", "text": "Supported knives, including Karambit Gamma Doppler, and legacy skins omitted by inventory import now appear." },
+        { "kind": "improved", "text": "Steam refresh shows its cooldown and privacy status while keeping saved items visible." }
+      ]
+    },
+    {
+      "version": "0.2.40",
+      "date": "2026-09-08",
+      "changes": [
+        {
+          "kind": "fixed",
+          "text": "Stopped signed-out setup and Settings from flashing between loading screens."
+        },
+        {
+          "kind": "fixed",
+          "text": "Signing out clears account data while keeping installation status visible and discarding late responses."
+        },
+        {
+          "kind": "improved",
+          "text": "Steam sign-in keeps setup in place while loading your profile, with retry after connection problems."
+        }
+      ]
+    },
+    {
+      "version": "0.2.39",
+      "date": "2026-09-08",
+      "changes": [
+        {
+          "kind": "added",
+          "text": "A Tauri interface for Play, Trading, Match history, Friends and Settings."
+        },
+        {
+          "kind": "improved",
+          "text": "Clear two-sided trade selection and review, with retained drafts and quiet updates."
+        },
+        {
+          "kind": "fixed",
+          "text": "Readable controls, responsive layouts and reliable Starting / In game status."
+        },
+        {
+          "kind": "improved",
+          "text": "First-time setup, reduced motion, and one launcher window per session."
+        }
+      ]
+    },
+    {
+      "version": "0.2.38",
+      "date": "2026-09-08",
+      "changes": [
+        {
+          "kind": "fixed",
+          "text": "Private or unavailable Steam inventory no longer blocks Play."
+        },
+        {
+          "kind": "fixed",
+          "text": "Clear FACEIT exit guidance and launch-error details."
+        }
+      ]
+    },
+    {
+      "version": "0.2.37",
+      "date": "2026-09-08",
+      "changes": [
+        {
+          "kind": "fixed",
+          "text": "Uninstall no longer restores an older B2G version from a backup."
+        }
+      ]
+    },
+    {
+      "version": "0.2.36",
+      "date": "2026-09-08",
+      "changes": [
+        {
+          "kind": "added",
+          "text": "Installation settings with repair and B2G uninstall controls."
+        },
+        {
+          "kind": "added",
+          "text": "Remove B2G while keeping Steam's CS:GO, settings, demos and loadout."
+        }
+      ]
+    },
+    {
+      "version": "0.2.35",
+      "date": "2026-09-08",
+      "changes": [
+        {
+          "kind": "fixed",
+          "text": "Missing in-game skins caused by conflicting restored equipment."
+        },
+        {
+          "kind": "fixed",
+          "text": "Preserve saved loadouts during local installation resets."
+        }
+      ]
+    },
+    {
+      "version": "0.2.34",
+      "date": "2026-09-08",
+      "changes": [
+        {
+          "kind": "fixed",
+          "text": "CS:GO startup errors after a fresh installation."
+        }
+      ]
+    },
+    {
+      "version": "0.2.33",
+      "date": "2026-09-08",
+      "changes": [
+        {
+          "kind": "added",
+          "text": "Friends, player search and native friend requests."
+        },
+        {
+          "kind": "added",
+          "text": "Player profiles with ELO, Steam links and mode-specific match stats."
+        },
+        {
+          "kind": "changed",
+          "text": "Refined icons, template details and five local profile pictures."
+        }
+      ]
+    },
+    {
+      "version": "0.2.32",
+      "date": "2026-09-07",
+      "changes": [
+        {
+          "kind": "fixed",
+          "text": "Clear first-install guidance when CS2 is installed."
+        },
+        {
+          "kind": "fixed",
+          "text": "CS2 download bytes no longer appear as CS:GO progress."
+        }
+      ]
+    },
+    {
+      "version": "0.2.31",
+      "date": "2026-09-07",
+      "changes": [
+        {
+          "kind": "added",
+          "text": "Guided CS:GO installation and native profile setup."
+        },
+        {
+          "kind": "changed",
+          "text": "Template artwork, layout and smooth hover effects."
+        },
+        {
+          "kind": "added",
+          "text": "Real loading progress and reduced-motion support."
+        },
+        {
+          "kind": "fixed",
+          "text": "Clear sign-in recovery and accessible setup controls."
+        }
+      ]
+    },
+    {
+      "version": "0.2.30",
+      "date": "2026-09-07",
+      "changes": [
+        {
+          "kind": "added",
+          "text": "Settings, match history and demo downloads."
+        },
+        {
+          "kind": "changed",
+          "text": "Hidden console with optional debug viewer."
+        },
+        {
+          "kind": "fixed",
+          "text": "Fluid Trading updates and refined icons."
+        },
+        {
+          "kind": "changed",
+          "text": "1,000 XP per level; existing XP preserved."
+        }
+      ]
+    },
+    {
+      "version": "0.2.29",
+      "date": "2026-09-07",
+      "changes": [
+        {
+          "kind": "added",
+          "text": "B2G player trading, offers and gifts."
+        },
+        {
+          "kind": "added",
+          "text": "Item previews and durable trade history."
+        },
+        {
+          "kind": "fixed",
+          "text": "Ownership-safe inventory and StatTrak sync."
+        }
+      ]
+    },
+    {
+      "version": "0.2.28",
+      "date": "2026-09-07",
+      "changes": [
+        {
+          "kind": "fixed",
+          "text": "Clean up case popup work after Escape."
+        },
+        {
+          "kind": "fixed",
+          "text": "Ignore late callbacks for closed case popups."
+        }
+      ]
+    },
+    {
+      "version": "0.2.27",
+      "date": "2026-09-07",
+      "changes": [
+        {
+          "kind": "changed",
+          "text": "Refined native launcher layout and type."
+        },
+        {
+          "kind": "added",
+          "text": "Scrollable news and release notes."
+        },
+        {
+          "kind": "fixed",
+          "text": "Clearer states and window controls."
+        }
+      ]
+    },
+    {
+      "version": "0.2.26",
+      "date": "2026-09-07",
+      "changes": [
+        {
+          "kind": "changed",
+          "text": "93% cases, 5% souvenirs, 2% pins."
+        },
+        {
+          "kind": "fixed",
+          "text": "Medal action only at level 40."
+        },
+        {
+          "kind": "fixed",
+          "text": "Correct item rarity colors in chat."
+        }
+      ]
+    },
+    {
+      "version": "0.2.25",
+      "date": "2026-09-07",
+      "changes": [
+        {
+          "kind": "added",
+          "text": "Redeem service medals in game."
+        },
+        {
+          "kind": "added",
+          "text": "2015–2023 medals and tier upgrades."
+        }
+      ]
+    },
+    {
+      "version": "0.2.24",
+      "date": "2026-09-07",
+      "changes": [
+        {
+          "kind": "fixed",
+          "text": "Owned skins in practice matches."
+        },
+        {
+          "kind": "changed",
+          "text": "StatTrak synchronization and server scheduling."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+bucket = "legacy-match-private-alpha-tofu-state"
+key    = "private-alpha-edge/tofu.tfstate"
+region = "auto"
+
+endpoints = {
+  s3 = "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
+}
+
+use_lockfile                = true
+use_path_style              = true
+skip_credentials_validation = true
+skip_metadata_api_check     = true
+skip_region_validation      = true
+skip_requesting_account_id  = true
+skip_s3_checksum            = true
