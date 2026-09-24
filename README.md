@@ -35,6 +35,10 @@ the GPL-3.0; it is not maintained and there is no hosted service.
 
 `docs/development-notes.md` is the original developer README.
 
+## Building and running
+
+See [INSTALL.md](INSTALL.md) for requirements, the files you must supply yourself and build steps.
+
 ## License
 
 GPL-3.0-only (see `LICENSE`). Third-party components keep their own licenses:
